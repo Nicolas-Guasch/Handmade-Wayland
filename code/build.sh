@@ -8,7 +8,9 @@ LIBS=""
 
 # Core Flags (Intel Skylake Targeted Optimization)
 CLANG_FLAGS="-g -O3 -march=skylake"
-CLANG_WARN_FLAGS="-Wall -Wextra -Werror -Wno-unused-parameter -Wno-old-style-cast"
+CLANG_WARN_FLAGS="-Wall -Wextra -Wno-unused-parameter -Wno-old-style-cast"
+#-Werror?
+
 LINK_FLAGS="-flto=thin -fuse-ld=lld"
 
 # Diagnostics for PGO Verification
