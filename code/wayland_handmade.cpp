@@ -20,28 +20,40 @@ typedef uint16_t uint16;
 typedef uint32_t uint32;
 typedef uint64_t uint64;
 
+global_variable uint32 wayland_current_id = 1;
+
+
+global_variable uint32 wayland_header_size = 8;
+
 global_variable uint32 wayland_display_object_id = 1;
+global_variable uint16 wayland_wl_display_get_registry_opcode = 1;
+global_variable uint16 wayland_wl_display_error_event = 0;
+
+global_variable uint16 wayland_wl_registry_bind_opcode = 0;
 global_variable uint16 wayland_wl_registry_event_global = 0;
-global_variable uint16 wayland_shm_pool_event_format = 0;
+
 global_variable uint16 wayland_wl_buffer_event_release = 0;
+
+global_variable uint16 wayland_wl_surface_attach_opcode = 1;
+global_variable uint16 wayland_wl_surface_commit_opcode=6;
+
+global_variable uint16 wayland_wl_shm_create_pool_opcode = 0;
+global_variable uint16 wayland_shm_pool_event_format = 0;
+
+global_variable uint16 wayland_wl_shm_pool_create_buffer_opcode = 0;
+
+global_variable uint16 wayland_wl_compositor_create_surface_opcode = 0;
+
 global_variable uint16 wayland_xdg_wm_base_event_ping = 0;
 global_variable uint16 wayland_xdg_toplevel_event_configure = 0;
 global_variable uint16 wayland_xdg_toplevel_event_close = 1;
-global_variable uint16 wayland_sdg_surface_event_configure = 0;
-global_variable uint16 wayland_wl_display_get_registry_opcode = 1;
-global_variable uint16 wayland_wl_registry_bind_opcode = 0;
-global_variable uint16 wayland_wl_compositor_create_surface_opcode = 0;
+global_variable uint16 wayland_xdg_surface_get_toplevel_opcode = 1;
 global_variable uint16 wayland_xdg_wm_base_pong_opcode = 3;
 global_variable uint16 wayland_xdg_surface_ack_configure_opcode = 4;
-global_variable uint16 wayland_wl_shm_create_pool_opcode = 0;
 global_variable uint16 wayland_xdg_wm_base_get_xdg_surface_opcode = 2;
-global_variable uint16 wayland_wl_shm_pool_create_buffer_opcode = 0;
-global_variable uint16 wayland_wl_surface_attach_opcode = 1;
-global_variable uint16 wayland_xdg_surface_get_toplevel_opcode = 1;
-global_variable uint16 wayland_wl_surface_commit_opcode=6;
-global_variable uint16 wayland_wl_display_error_event = 0;
+global_variable uint16 wayland_sdg_surface_event_configure = 0;
+
 global_variable uint32 wayland_format_xrgb8888 = 1;
-global_variable uint32 wayland_header_size = 8;
 global_variable uint32 color_channels = 4;
 
 #define cstring_len(s) (sizeof(s) - 1)
@@ -55,13 +67,22 @@ struct sockaddr_un {
 };
 */
 
-struct String {
+struct String_Buffer {
     char *data;
     size_t count;
+    size_t cap;
 };
 
-void str_append(String *dest, String_View *src) {
+void str_append(String_Buffer *dest, String_View *src) {
+    assert(dest->count + src->count <= dest->cap);
     memcpy(dest->data + dest->count, src->data, src->count);
+    dest->count += src->count;
+}
+
+void str_append_n(String_Buffer *dest, String_View *src, size_t n) {
+    assert(dest->count + n <= dest->cap);
+    assert(src->count >= n);
+    memcpy(dest->data + dest->count, src->data, n);
     dest->count += src->count;
 }
 
@@ -76,8 +97,12 @@ internal int wayland_display_connect() {
         .sun_family = AF_UNIX,
         .sun_path = {0}
     };
-    assert(xdg_runtime_dir.count < cstring_len(addr.sun_path));
-    String socket_path = {.data = addr.sun_path, .count = 0};
+    String_Buffer socket_path = {
+        .data = addr.sun_path, 
+        .count = 0, 
+        .cap = cstring_len(addr.sun_path)
+    };
+    assert(xdg_runtime_dir.count < socket_path.cap);
     
     str_append(&socket_path, &xdg_runtime_dir);
     socket_path.data[socket_path.count++] = '/';
@@ -86,11 +111,11 @@ internal int wayland_display_connect() {
     if (wayland_display.data == NULL) {
         String_View wayland_display_default = sv("wayland-0");
         assert(socket_path.count + wayland_display_default.count 
-                <= cstring_len(addr.sun_path));
+                <= socket_path.cap);
         str_append(&socket_path, &wayland_display_default);
     } else {
         assert(socket_path.count + wayland_display.count 
-                <= cstring_len(addr.sun_path));
+                <= socket_path.cap);
         str_append(&socket_path, &wayland_display);
     }
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -107,11 +132,98 @@ internal int wayland_display_connect() {
     return fd;
 }
 
+internal void buf_write_u32(String_Buffer *buf, uint32 x) {
+    assert(buf->count + sizeof(x) <= buf->cap);
+    assert(((size_t)buf->data + buf->count) % sizeof(x) == 0); // Alignment check.
+
+    *(uint32 *)(buf->data + buf->count) = x;
+    buf->count += sizeof(x);
+}
+internal void buf_write_u16(String_Buffer *buf, uint16 x) {
+    assert(buf->count + sizeof(x) <= buf->cap);
+    assert(((size_t)buf->data + buf->count) % sizeof(x) == 0); // Alignment check.
+
+    *(uint32 *)(buf->data + buf->count) = x;
+    buf->count += sizeof(x);
+}
+internal void buf_write_string(String_Buffer *buf, String_View *src) {
+    buf_write_u32(buf, src->count);
+
+    assert(buf->count + src->count <= buf->cap);
+    str_append(buf, src);
+    // Add word alignement padding
+    while (buf->count & 3) buf->data[buf->count++] = 0;
+}
+
+internal uint32 buf_read_u32(String_View *buf) {
+    assert(buf->count >= sizeof(uint32));
+    assert((size_t)buf->data % sizeof(uint32) == 0);
+
+    uint32 result = *(uint32 *)buf->data;
+    buf->data += sizeof(result);
+    buf->count -= sizeof(result);
+
+    return result;
+}
+internal uint16 buf_read_u16(String_View *buf) {
+    assert(buf->count >= sizeof(uint16));
+    assert((size_t)buf->data % sizeof(uint16) == 0);
+
+    uint16 result = *(uint16 *)buf->data;
+    buf->data += sizeof(result);
+    buf->count -= sizeof(result);
+
+    return result;
+}
+internal void buf_read_n(String_View *buf, String_Buffer *dst, size_t n) {
+    str_append_n(dst, buf, n);
+    buf->data += n;
+    buf->count -= n;
+}
+
+internal uint32 wayland_wl_display_get_registry(int fd) {
+    // Create message buffer
+    char msg[128] = "";
+    String_Buffer msg_buf = {
+        .data = msg,
+        .count = 0,
+        .cap = sizeof(msg)
+    };
+
+    // Write wl_display id to buffer
+    buf_write_u32(&msg_buf, wayland_display_object_id); 
+    
+    // Write get_registry opcode to buffer
+    buf_write_u16(&msg_buf, wayland_wl_display_get_registry_opcode);
+
+    // Write the size of the message to buffer
+    uint16 msg_announced_size =
+        wayland_header_size + sizeof(wayland_current_id);
+    assert((msg_announced_size & 3) == 0); // Word aligned.
+    buf_write_u16(&msg_buf, msg_announced_size);
+    
+    wayland_current_id++;
+    // Write the argument, the id for the new wl_registry, to buffer
+    buf_write_u32(&msg_buf, wayland_current_id);
+
+    // Send message to socket
+    if ((int64)msg_buf.count != 
+            send(fd, msg_buf.data, msg_buf.count, MSG_DONTWAIT)) {
+        exit(errno);
+    }
+    
+    return wayland_current_id;
+}
+
 int main(int argc, char * argv[]) {
     (void)argc;
     (void)argv;
 
-    // Ope
+    // Open a UNIX domain socket.
     int fd = wayland_display_connect();
+    // Request a registry from wl_display to list and bind global objects.
+    // wl_display::get_registry
+    uint32 wl_registry = wayland_wl_display_get_registry(fd);
+    
     return 0;
 }
