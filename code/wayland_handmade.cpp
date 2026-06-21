@@ -133,6 +133,7 @@ void str_append_n(String_Buffer *dest, String_View *src, size_t n) {
     assert(src->count >= n);
     memcpy(dest->data + dest->count, src->data, n);
     dest->count += src->count;
+    dest->data[dest->count]=0;
 }
 
 internal int wayland_display_connect() {
@@ -186,31 +187,59 @@ internal void set_socket_nonblocking(int fd) {
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+struct Byte_Buffer {
+    uint8 *data;
+    size_t count;
+    size_t cap;
+};
+typedef struct Byte_Buffer Byte_Buffer;
 
-internal void buf_write_u32(String_Buffer *buf, uint32 x) {
+struct Byte_View {
+    const uint8 *data;
+    size_t count;
+};
+typedef struct Byte_View Byte_View;
+
+void buf_append(Byte_Buffer *dest, Byte_View *src) {
+    assert(dest->count + src->count <= dest->cap);
+    memcpy(dest->data + dest->count, src->data, src->count);
+    dest->count += src->count;
+}
+
+void buf_append_n(Byte_Buffer *dest, Byte_View *src, size_t n) {
+    assert(dest->count + n <= dest->cap);
+    assert(src->count >= n);
+    memcpy(dest->data + dest->count, src->data, n);
+    dest->count += src->count;
+}
+
+internal void buf_write_u32(Byte_Buffer *buf, uint32 x) {
     assert(buf->count + sizeof(x) <= buf->cap);
     assert(((size_t)buf->data + buf->count) % sizeof(x) == 0); // Alignment check.
 
     *(uint32 *)(buf->data + buf->count) = x;
     buf->count += sizeof(x);
 }
-internal void buf_write_u16(String_Buffer *buf, uint16 x) {
+internal void buf_write_u16(Byte_Buffer *buf, uint16 x) {
     assert(buf->count + sizeof(x) <= buf->cap);
     assert(((size_t)buf->data + buf->count) % sizeof(x) == 0); // Alignment check.
 
     *(uint16 *)(buf->data + buf->count) = x;
     buf->count += sizeof(x);
 }
-internal void buf_write_string(String_Buffer *buf, String_View *src) {
+internal void buf_write_string(Byte_Buffer *buf, String_View *src) {
     buf_write_u32(buf, src->count);
 
-    assert(buf->count + src->count <= buf->cap);
-    str_append(buf, src);
+    Byte_View str_bytes = {.data = (uint8 *)src->data, .count = src->count};
+    assert(buf->count + str_bytes.count < buf->cap);
+    buf_append(buf, &str_bytes);
+    // Add null terminator
+    buf->data[buf->count++] = 0;
     // Add word alignement padding
     while (buf->count & 3) buf->data[buf->count++] = 0;
 }
 
-internal uint32 buf_read_u32(String_View *buf) {
+internal uint32 buf_read_u32(Byte_View *buf) {
     assert(buf->count >= sizeof(uint32));
     assert((size_t)buf->data % sizeof(uint32) == 0);
 
@@ -220,7 +249,7 @@ internal uint32 buf_read_u32(String_View *buf) {
 
     return result;
 }
-internal uint16 buf_read_u16(String_View *buf) {
+internal uint16 buf_read_u16(Byte_View *buf) {
     assert(buf->count >= sizeof(uint16));
     assert((size_t)buf->data % sizeof(uint16) == 0);
 
@@ -230,19 +259,19 @@ internal uint16 buf_read_u16(String_View *buf) {
 
     return result;
 }
-internal void buf_read_n(String_View *buf, String_Buffer *dst, size_t n) {
-    str_append_n(dst, buf, n);
+internal void buf_read_n(Byte_View *buf, Byte_Buffer *dst, size_t n) {
+    buf_append_n(dst, buf, n);
     buf->data += n;
     buf->count -= n;
 }
 
 internal uint32 wayland_wl_display_get_registry(int fd) {
     // Create message buffer
-    char msg[128] = "";
-    String_Buffer msg_buf = {
+    uint8 msg[128] = "";
+    Byte_Buffer msg_buf = {
         .data = msg,
         .count = 0,
-        .cap = cstring_len(msg)
+        .cap = sizeof(msg)
     };
 
     // Write wl_display id to buffer
@@ -382,7 +411,7 @@ internal void resizeWindowBuffer(state_t *state, uint32 width, uint32 height) {
     else free(buf);
 }
 
-internal void wayland_handle_message(int fd, state_t *state, String_View *msg) {
+internal void wayland_handle_message(int fd, state_t *state, Byte_View *msg) {
     assert(msg->count >= 8);
 
     uint32 object_id = buf_read_u32(msg);
@@ -403,18 +432,19 @@ internal void wayland_handle_message(int fd, state_t *state, String_View *msg) {
                 {
                     uint32 target_object_id = buf_read_u32(msg);
                     uint32 code = buf_read_u32(msg);
-                    char error_buf[512] = "";
-                    String_Buffer error_msg = {
+                    uint8 error_buf[512] = "";
+                    Byte_Buffer error_msg = {
                         .data = error_buf,
                         .count = 0,
-                        .cap = cstring_len(error_buf)
+                        .cap = sizeof(error_buf)
                     };
                     uint32 error_len = roundup_4(buf_read_u32(msg));
                     buf_read_n(msg, &error_msg, error_len);
-
+                    
                     fprintf(stderr, 
-                            "fatal error: target_object_id=%u code=%u error%s\n",
-                            target_object_id, code, error_msg.data);
+                            "fatal error: target_object_id=%u code=%u error="
+                            SV_FMT "\n",
+                            target_object_id, code, SV_Arg(error_msg));
                     running = false;
                 } break;
         }
@@ -433,8 +463,8 @@ internal void wayland_handle_message(int fd, state_t *state, String_View *msg) {
 }
 
 struct Compositor_Message_Buf {
-    char read_buf[4096];
-    char *head;
+    uint8 read_buf[4096];
+    uint8 *head;
     size_t count;
     size_t cap;
 };
@@ -443,45 +473,35 @@ typedef struct Compositor_Message_Buf Compositor_Message_Buf;
 internal void init_compositor_message_buf(Compositor_Message_Buf *buf) {
     buf->head = buf->read_buf;
     buf->count = 0;
-    buf->cap = cstring_len(buf->read_buf);
+    buf->cap = sizeof(buf->read_buf);
     memset(buf->read_buf, 0, buf->cap);
 }
 
 enum EVENT_BUFFER_STATE {
-    MSG_READY = 1,
-    MSG_WOULD_BLOCK = 2,
-    MSG_NEED_MORE = 4,
-    MSG_CLOSED = 8,
-    MSG_ERROR = 16
+    SOCKET_READ_SOME = 1,
+    SOCKET_WOULD_BLOCK = 2,
+    SOCKET_BUFFER_FULL = 4,
+    SOCKET_CLOSED = 8,
+    SOCKET_ERROR = 16
 };
 typedef enum EVENT_BUFFER_STATE EVENT_BUFFER_STATE;
 
-#define TIMEOUT 0
-internal bool poll_socket(int fd) {
-    struct pollfd pfd = {
-        .fd = fd,
-        .events = POLLIN
-    };
-    poll(&pfd, 1, TIMEOUT);
-    return (pfd.revents & POLLIN);
-}
-
-internal int64 read_socket(int fd, char **buffer, size_t *cap, EVENT_BUFFER_STATE *response) {
+internal int64 read_socket(int fd, uint8 **buffer, size_t *cap, EVENT_BUFFER_STATE *response) {
     int64 read_bytes = recv(fd, *buffer, *cap, 0);
     if (read_bytes == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             // NOTE: Non fatal error. Nothing to read.
-            *response = MSG_WOULD_BLOCK;
+            *response = SOCKET_WOULD_BLOCK;
             read_bytes = 0;
         }
         else {
-            *response = MSG_ERROR;
+            *response = SOCKET_ERROR;
             read_bytes = 0;
         }
     } else if (read_bytes == 0) {
-        *response = MSG_CLOSED;
+        *response = SOCKET_CLOSED;
     } else {
-        *response = MSG_READY;
+        *response = SOCKET_READ_SOME;
     }
     *buffer += read_bytes;
     *cap -= read_bytes;
@@ -489,7 +509,6 @@ internal int64 read_socket(int fd, char **buffer, size_t *cap, EVENT_BUFFER_STAT
     return read_bytes;
 }
 
-#define buffer_low_mark 512 + 8 + 8
 internal void shift_buffer(Compositor_Message_Buf *buf) {
     // If low on space, move head to start.
     if ( buf->head > buf->read_buf) {
@@ -503,8 +522,7 @@ internal void shift_buffer(Compositor_Message_Buf *buf) {
     }
 }
 
-internal bool get_compositor_message(Compositor_Message_Buf *buf, String_Buffer *msg) {
-    EVENT_BUFFER_STATE response = MSG_READY;
+internal bool get_compositor_message(Compositor_Message_Buf *buf, Byte_Buffer *msg) {
     fprintf(stderr,"EVENT BUFFER: %lu\n\n", buf->count);
     if (buf->count < wayland_header_size) {
         // Last header is incomplete, retrieve announced_size
@@ -512,13 +530,13 @@ internal bool get_compositor_message(Compositor_Message_Buf *buf, String_Buffer 
     }
 
     uint16 announced_size = *(uint16 *)(buf->head + sizeof(uint32) + sizeof(uint16));
-    assert(roundup_4(announced_size) <= announced_size);
+    assert(announced_size >= wayland_header_size && (announced_size & 3) == 0);
     if (announced_size > buf->count) {
         return false;
     }
-    String_View buf_view = {.data = buf->head, .count = announced_size};
+    Byte_View buf_view = {.data = buf->head, .count = announced_size};
 
-    str_append(msg, &buf_view);
+    buf_append(msg, &buf_view);
 
     buf->head += announced_size;
     buf->count -= announced_size;
@@ -527,36 +545,43 @@ internal bool get_compositor_message(Compositor_Message_Buf *buf, String_Buffer 
 }
 
 internal EVENT_BUFFER_STATE fetch_from_socket(int fd, Compositor_Message_Buf *buf) {
-    EVENT_BUFFER_STATE response = MSG_READY;
+    EVENT_BUFFER_STATE response = SOCKET_READ_SOME;
 
     shift_buffer(buf); 
 
-    char *read_end = buf->head + buf->count;
+    uint8 *read_end = buf->head + buf->count;
     if (buf->count > 0) {
         if (buf->count < wayland_header_size) {
             // Last header is incomplete, retrieve announced_size
             size_t missing_header = wayland_header_size - buf->count;
-            buf->count += read_socket(fd, &read_end, &missing_header, &response);
-            if (response != MSG_READY) return response;
-            assert(missing_header == 0);
+            while (missing_header > 0) {
+                buf->count += read_socket(fd, &read_end, &missing_header, &response);
+                if (response != SOCKET_READ_SOME) return response;
+            }
         }
 
         uint16 announced_size = *(uint16 *)(buf->head + sizeof(uint32) + sizeof(uint16));
-        assert(roundup_4(announced_size) <= announced_size);
+        assert(announced_size >= wayland_header_size && (announced_size & 3) == 0);
+        assert(announced_size <= buf->cap);
         if (announced_size > buf->count) {
             // Last message got cut on read.
             size_t missing_arguments = announced_size - buf->count;
-            buf->count += read_socket(fd, &read_end, &missing_arguments, &response);
-            if (response != MSG_READY) return response;
+            while (missing_arguments > 0) {
+                buf->count += read_socket(fd, &read_end, &missing_arguments, &response);
+                if (response != SOCKET_READ_SOME) return response;
+            }
             assert(missing_arguments == 0);
         }
     }
 
-    size_t free_count = (char *)(buf->read_buf + buf->cap) - read_end;
+    size_t free_count = (uint8 *)(buf->read_buf + buf->cap) - read_end;
     assert(free_count >= 0);
     if (free_count > 0 && buf->count == 0) {
         buf->count += read_socket(fd, &read_end, &free_count, &response);
-        if (response != MSG_READY) return response;
+        if (response != SOCKET_READ_SOME) return response;
+    }
+    if (free_count == 0) {
+        response = SOCKET_BUFFER_FULL;
     }
     return response;
 }
@@ -583,23 +608,22 @@ int main(int argc, char * argv[]) {
     Compositor_Message_Buf read_buffer;
     init_compositor_message_buf(&read_buffer);
     while (running) {
-        char msg_buf[4096] = "";
+        uint8 msg_buf[4096] = "";
 
-        String_Buffer msg = {
+        Byte_Buffer msg = {
             .data = msg_buf,
             .count = 0,
-            .cap = cstring_len(msg_buf)
+            .cap = sizeof(msg_buf)
         };
 
-        EVENT_BUFFER_STATE socket_read_status = MSG_NEED_MORE;
+        EVENT_BUFFER_STATE socket_read_status = SOCKET_READ_SOME;
         do {
             socket_read_status = fetch_from_socket(fd, &read_buffer);
-            if (socket_read_status & (MSG_CLOSED | MSG_ERROR)) {
-                // TODO: recv == 0  might report as false positive.
+            if (socket_read_status & (SOCKET_CLOSED | SOCKET_ERROR)) {
                 running = false;
             }
             while (running && get_compositor_message(&read_buffer, &msg)) {
-                String_View msg_view = {
+                Byte_View msg_view = {
                     .data = msg.data,
                     .count = msg.count
                 };
@@ -607,10 +631,10 @@ int main(int argc, char * argv[]) {
                 msg = {
                     .data = msg_buf,
                     .count = 0,
-                    .cap = cstring_len(msg_buf)
+                    .cap = sizeof(msg_buf)
                 };
             }
-        } while (running && socket_read_status == MSG_NEED_MORE);
+        } while (running && socket_read_status != SOCKET_WOULD_BLOCK);
         if (!running) {
             // TODO: Log what happened.
             break;
