@@ -1,6 +1,7 @@
 #ifndef _GNU_SOURCE
-#define _GNU_SOURCE
+#define _GNU_SOURCE //memfd_create is Linux only
 #endif
+#include <stdio.h> //standard I/O
 #include <stdint.h> //types
 #include <stdlib.h> //getenv rand
 #include <errno.h> //EINVAL
@@ -8,9 +9,13 @@
 #include <sys/un.h> //sockaddr_un
 #include <sys/socket.h> //AF_UNIX SOCK_STREAM socket sockaddr connect
 #include <sys/mman.h> // memfd_create mmap
+#include <poll.h> // poll pollfd
 #include <fcntl.h> // fcntl F_ADD_SEALS F_SEAL_SEAL F_SEAL_SHRINK
 #include <unistd.h> //ftruncate
 #include "stringView.c" // String_View sv
+
+#define SV_FMT "%.*s" 
+#define SV_Arg(s) (int)(s).count, (s).data
 
 #define internal static
 #define local_persist static
@@ -66,37 +71,38 @@ global_variable uint32 wayland_current_id = 1;
 global_variable bool running = true;
 
 // Wayland protocol numeric values
-global_variable uint32 wayland_header_size = 8;
+#define wayland_header_size 8
 
-global_variable uint32 wayland_display_object_id = 1;
-global_variable uint16 wayland_wl_display_get_registry_opcode = 1;
-global_variable uint16 wayland_wl_display_error_event = 0;
+#define wayland_display_object_id 1
+#define wayland_wl_display_get_registry_opcode 1
+#define wayland_wl_display_error_event 0
 
-global_variable uint16 wayland_wl_registry_bind_opcode = 0;
-global_variable uint16 wayland_wl_registry_event_global = 0;
+#define wayland_wl_registry_bind_opcode 0
+#define wayland_wl_registry_event_global 0
+#define wayland_wl_registry_event_global_remove 1
 
-global_variable uint16 wayland_wl_buffer_event_release = 0;
+#define wayland_wl_buffer_event_release 0
 
-global_variable uint16 wayland_wl_surface_attach_opcode = 1;
-global_variable uint16 wayland_wl_surface_commit_opcode=6;
+#define wayland_wl_surface_attach_opcode 1
+#define wayland_wl_surface_commit_opcode6
 
-global_variable uint16 wayland_wl_shm_create_pool_opcode = 0;
-global_variable uint16 wayland_shm_pool_event_format = 0;
+#define wayland_wl_shm_create_pool_opcode 0
+#define wayland_shm_pool_event_format 0
 
-global_variable uint16 wayland_wl_shm_pool_create_buffer_opcode = 0;
+#define wayland_wl_shm_pool_create_buffer_opcode 0
 
-global_variable uint16 wayland_wl_compositor_create_surface_opcode = 0;
+#define wayland_wl_compositor_create_surface_opcode 0
 
-global_variable uint16 wayland_xdg_wm_base_event_ping = 0;
-global_variable uint16 wayland_xdg_toplevel_event_configure = 0;
-global_variable uint16 wayland_xdg_toplevel_event_close = 1;
-global_variable uint16 wayland_xdg_surface_get_toplevel_opcode = 1;
-global_variable uint16 wayland_xdg_wm_base_pong_opcode = 3;
-global_variable uint16 wayland_xdg_surface_ack_configure_opcode = 4;
-global_variable uint16 wayland_xdg_wm_base_get_xdg_surface_opcode = 2;
-global_variable uint16 wayland_sdg_surface_event_configure = 0;
+#define wayland_xdg_wm_base_event_ping 0
+#define wayland_xdg_toplevel_event_configure 0
+#define wayland_xdg_toplevel_event_close 1
+#define wayland_xdg_surface_get_toplevel_opcode 1
+#define wayland_xdg_wm_base_pong_opcode 3
+#define wayland_xdg_surface_ack_configure_opcode 4
+#define wayland_xdg_wm_base_get_xdg_surface_opcode 2
+#define wayland_sdg_surface_event_configure 0
 
-global_variable uint32 wayland_format_xrgb8888 = 1;
+#define wayland_format_xrgb8888 1
 
 #define cstring_len(s) (sizeof(s) - 1)
 #define roundup_4(n) (((n) + 3) & -4)
@@ -119,6 +125,7 @@ void str_append(String_Buffer *dest, String_View *src) {
     assert(dest->count + src->count <= dest->cap);
     memcpy(dest->data + dest->count, src->data, src->count);
     dest->count += src->count;
+    dest->data[dest->count]=0;
 }
 
 void str_append_n(String_Buffer *dest, String_View *src, size_t n) {
@@ -173,6 +180,12 @@ internal int wayland_display_connect() {
 
     return fd;
 }
+
+internal void set_socket_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
 
 internal void buf_write_u32(String_Buffer *buf, uint32 x) {
     assert(buf->count + sizeof(x) <= buf->cap);
@@ -229,7 +242,7 @@ internal uint32 wayland_wl_display_get_registry(int fd) {
     String_Buffer msg_buf = {
         .data = msg,
         .count = 0,
-        .cap = sizeof(msg)
+        .cap = cstring_len(msg)
     };
 
     // Write wl_display id to buffer
@@ -369,12 +382,192 @@ internal void resizeWindowBuffer(state_t *state, uint32 width, uint32 height) {
     else free(buf);
 }
 
+internal void wayland_handle_message(int fd, state_t *state, String_View *msg) {
+    assert(msg->count >= 8);
+
+    uint32 object_id = buf_read_u32(msg);
+    assert(object_id <= wayland_current_id);
+
+    uint16 opcode = buf_read_u16(msg);
+
+    uint16 announced_size = buf_read_u16(msg);
+    assert(roundup_4(announced_size) <= announced_size);
+
+    uint32 header_size =
+        sizeof(object_id) + sizeof(opcode) + sizeof(announced_size);
+    assert(announced_size <= header_size + msg->count);
+
+    if (object_id == wayland_display_object_id) {
+        switch (opcode) {
+            case wayland_wl_display_error_event:
+                {
+                    uint32 target_object_id = buf_read_u32(msg);
+                    uint32 code = buf_read_u32(msg);
+                    char error_buf[512] = "";
+                    String_Buffer error_msg = {
+                        .data = error_buf,
+                        .count = 0,
+                        .cap = cstring_len(error_buf)
+                    };
+                    uint32 error_len = roundup_4(buf_read_u32(msg));
+                    buf_read_n(msg, &error_msg, error_len);
+
+                    fprintf(stderr, 
+                            "fatal error: target_object_id=%u code=%u error%s\n",
+                            target_object_id, code, error_msg.data);
+                    running = false;
+                } break;
+        }
+    } else if (object_id == state->wl_registry) {
+        fprintf(stderr,"wl_registry event:");
+        switch (opcode) {
+            case wayland_wl_registry_event_global: 
+                {
+                        fprintf(stderr,"global\npayload: ");
+                        fwrite(msg->data+8, 1, msg->count-8, stderr);
+                        fprintf(stderr,"\n");
+                        // read name, interface, version
+                } break;
+        }
+    }
+}
+
+struct Compositor_Message_Buf {
+    char read_buf[4096];
+    char *head;
+    size_t count;
+    size_t cap;
+};
+typedef struct Compositor_Message_Buf Compositor_Message_Buf;
+
+internal void init_compositor_message_buf(Compositor_Message_Buf *buf) {
+    buf->head = buf->read_buf;
+    buf->count = 0;
+    buf->cap = cstring_len(buf->read_buf);
+    memset(buf->read_buf, 0, buf->cap);
+}
+
+enum EVENT_BUFFER_STATE {
+    MSG_READY = 1,
+    MSG_WOULD_BLOCK = 2,
+    MSG_NEED_MORE = 4,
+    MSG_CLOSED = 8,
+    MSG_ERROR = 16
+};
+typedef enum EVENT_BUFFER_STATE EVENT_BUFFER_STATE;
+
+#define TIMEOUT 0
+internal bool poll_socket(int fd) {
+    struct pollfd pfd = {
+        .fd = fd,
+        .events = POLLIN
+    };
+    poll(&pfd, 1, TIMEOUT);
+    return (pfd.revents & POLLIN);
+}
+
+internal int64 read_socket(int fd, char **buffer, size_t *cap, EVENT_BUFFER_STATE *response) {
+    int64 read_bytes = recv(fd, *buffer, *cap, 0);
+    if (read_bytes == -1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // NOTE: Non fatal error. Nothing to read.
+            *response = MSG_WOULD_BLOCK;
+            read_bytes = 0;
+        }
+        else {
+            *response = MSG_ERROR;
+            read_bytes = 0;
+        }
+    } else if (read_bytes == 0) {
+        *response = MSG_CLOSED;
+    } else {
+        *response = MSG_READY;
+    }
+    *buffer += read_bytes;
+    *cap -= read_bytes;
+    fprintf(stderr,"READ: %lu\n", read_bytes);
+    return read_bytes;
+}
+
+#define buffer_low_mark 512 + 8 + 8
+internal void shift_buffer(Compositor_Message_Buf *buf) {
+    // If low on space, move head to start.
+    if ( buf->head > buf->read_buf) {
+        // ran out of space or about to run out and there's some free prefix
+        // or over half of the buffer is free prefix
+        assert(buf->count < buf->cap);
+        assert((char *)(buf->head + buf->count) 
+                <= (char *)(buf->read_buf + buf->cap));
+        memmove(buf->read_buf, buf->head, buf->count);
+        buf->head = buf->read_buf;
+    }
+}
+
+internal bool get_compositor_message(Compositor_Message_Buf *buf, String_Buffer *msg) {
+    EVENT_BUFFER_STATE response = MSG_READY;
+    fprintf(stderr,"EVENT BUFFER: %lu\n\n", buf->count);
+    if (buf->count < wayland_header_size) {
+        // Last header is incomplete, retrieve announced_size
+        return false;
+    }
+
+    uint16 announced_size = *(uint16 *)(buf->head + sizeof(uint32) + sizeof(uint16));
+    assert(roundup_4(announced_size) <= announced_size);
+    if (announced_size > buf->count) {
+        return false;
+    }
+    String_View buf_view = {.data = buf->head, .count = announced_size};
+
+    str_append(msg, &buf_view);
+
+    buf->head += announced_size;
+    buf->count -= announced_size;
+    
+    return true;
+}
+
+internal EVENT_BUFFER_STATE fetch_from_socket(int fd, Compositor_Message_Buf *buf) {
+    EVENT_BUFFER_STATE response = MSG_READY;
+
+    shift_buffer(buf); 
+
+    char *read_end = buf->head + buf->count;
+    if (buf->count > 0) {
+        if (buf->count < wayland_header_size) {
+            // Last header is incomplete, retrieve announced_size
+            size_t missing_header = wayland_header_size - buf->count;
+            buf->count += read_socket(fd, &read_end, &missing_header, &response);
+            if (response != MSG_READY) return response;
+            assert(missing_header == 0);
+        }
+
+        uint16 announced_size = *(uint16 *)(buf->head + sizeof(uint32) + sizeof(uint16));
+        assert(roundup_4(announced_size) <= announced_size);
+        if (announced_size > buf->count) {
+            // Last message got cut on read.
+            size_t missing_arguments = announced_size - buf->count;
+            buf->count += read_socket(fd, &read_end, &missing_arguments, &response);
+            if (response != MSG_READY) return response;
+            assert(missing_arguments == 0);
+        }
+    }
+
+    size_t free_count = (char *)(buf->read_buf + buf->cap) - read_end;
+    assert(free_count >= 0);
+    if (free_count > 0 && buf->count == 0) {
+        buf->count += read_socket(fd, &read_end, &free_count, &response);
+        if (response != MSG_READY) return response;
+    }
+    return response;
+}
+
 int main(int argc, char * argv[]) {
     (void)argc;
     (void)argv;
 
     // Open a UNIX domain socket.
     int fd = wayland_display_connect();
+    set_socket_nonblocking(fd);
 
     int defaultWidth = 1280;
     int defaultHeight = 720;
@@ -387,10 +580,42 @@ int main(int argc, char * argv[]) {
 
     resizeWindowBuffer(&clientState, defaultWidth, defaultHeight);
 
+    Compositor_Message_Buf read_buffer;
+    init_compositor_message_buf(&read_buffer);
     while (running) {
+        char msg_buf[4096] = "";
+
+        String_Buffer msg = {
+            .data = msg_buf,
+            .count = 0,
+            .cap = cstring_len(msg_buf)
+        };
+
+        EVENT_BUFFER_STATE socket_read_status = MSG_NEED_MORE;
+        do {
+            socket_read_status = fetch_from_socket(fd, &read_buffer);
+            if (socket_read_status & (MSG_CLOSED | MSG_ERROR)) {
+                // TODO: recv == 0  might report as false positive.
+                running = false;
+            }
+            while (running && get_compositor_message(&read_buffer, &msg)) {
+                String_View msg_view = {
+                    .data = msg.data,
+                    .count = msg.count
+                };
+                wayland_handle_message(fd, &clientState, &msg_view);
+                msg = {
+                    .data = msg_buf,
+                    .count = 0,
+                    .cap = cstring_len(msg_buf)
+                };
+            }
+        } while (running && socket_read_status == MSG_NEED_MORE);
+        if (!running) {
+            // TODO: Log what happened.
+            break;
+        }
         // TODO:
-        // Read message into buffer.
-        // While buffer's not empty, handle compositor's message.
         // If bind phase complete, create surface.
         // If ack configure confirmed:
         //     Create wl_shm_pool if there's none.
@@ -399,6 +624,13 @@ int main(int argc, char * argv[]) {
         //     wl_surface_attach
         //     wl_surface_commit
         // Cleanup:
+        int timeout_ms = 16;
+        struct pollfd pfd = {
+            .fd = fd,
+            .events = POLLIN
+        };
+
+        poll(&pfd, 1, timeout_ms);
 
     }
 
