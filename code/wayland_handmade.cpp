@@ -9,6 +9,7 @@
 #include <sys/un.h> //sockaddr_un
 #include <sys/socket.h> //AF_UNIX SOCK_STREAM socket sockaddr connect
 #include <sys/mman.h> // memfd_create mmap
+#include <sys/uio.h> // iovec
 #include <poll.h> // poll pollfd
 #include <fcntl.h> // fcntl F_ADD_SEALS F_SEAL_SEAL F_SEAL_SHRINK
 #include <unistd.h> //ftruncate
@@ -429,17 +430,18 @@ internal void init_fd_queue(Fd_Queue *fdq) {
     fdq->cap = WAYLAND_FD_QUEUE_CAP;
 }
 
-internal void Fd_Queue_Push(int fd, Fd_Queue *fdq) {
-    assert(fdq->count < fdq->cap);
+internal bool Fd_Queue_Push(int fd, Fd_Queue *fdq) {
+    if (fdq->count == fdq->cap) return false;
     int next = (fdq->head+fdq->count) < fdq->cap ?
         (fdq->head+fdq->count) :
         (fdq->head+fdq->count) - fdq->cap;
 
     fdq->fds[next] = fd;  
     fdq->count++;
+    return true;
 }
 
-internal int Fd_Queue_Pop(int fd, Fd_Queue *fdq) {
+internal int Fd_Queue_Pop(Fd_Queue *fdq) {
     assert(fdq->count > 0);
     int result = fdq->fds[fdq->head];
     fdq->head++;
@@ -566,23 +568,31 @@ internal int64 read_socket(int fd, uint8 **buffer, size_t *cap, Fd_Queue *fdq,
     if (mh.msg_flags & MSG_CTRUNC) {
         // TODO: Log that ancillary fds were lost on transmission.
         *response = SOCKET_ERROR;
+        read_bytes = 0;
     }
-    *buffer += read_bytes;
-    *cap -= read_bytes;
-    fprintf(stderr,"READ: %lu\n", read_bytes);
+    fprintf(stderr,"READ: %zd - result=%d\n", read_bytes,*response);
+    
+    if (read_bytes) {
+        *buffer += read_bytes;
+        *cap -= read_bytes;
+        for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&mh);
+                cmsg;
+                cmsg = CMSG_NXTHDR(&mh, cmsg)) {
+            if (cmsg->cmsg_level == SOL_SOCKET &&
+                    cmsg->cmsg_type == SCM_RIGHTS) {
+                size_t data_len = cmsg->cmsg_len - CMSG_LEN(0);
+                size_t fd_count = data_len /sizeof(int);
+                int *fds = (int *)CMSG_DATA(cmsg);
 
-    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&mh);
-            cmsg;
-            cmsg = CMSG_NXTHDR(&mh, cmsg)) {
-        if (cmsg->cmsg_level == SOL_SOCKET &&
-            cmsg->cmsg_type == SCM_RIGHTS) {
-            size_t data_len = cmsg->cmsg_len - CMSG_LEN(0);
-            size_t fd_count = data_len /sizeof(int);
-            int *fds = (int *)CMSG_DATA(cmsg);
-
-            for (size_t i = 0; i < fd_count; i++) {
-                Fd_Queue_Push(fds[i], fdq);
-                fprintf(stderr,"READ ANCILLARY FD: %d\n", fds[i]);
+                for (size_t i = 0; i < fd_count; i++) {
+                    if(!Fd_Queue_Push(fds[i], fdq)) {
+                        // TODO: Log queue overflow
+                        // TODO: might want to close(fds[i]) if intending to keep running.
+                        *response = SOCKET_ERROR;
+                        return 0;
+                    }
+                    fprintf(stderr,"READ ANCILLARY FD: %d\n", fds[i]);
+                }
             }
         }
     }
