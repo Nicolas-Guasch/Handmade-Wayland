@@ -88,20 +88,23 @@ global_variable bool running = true;
 #define wayland_wl_surface_commit_opcode6
 
 #define wayland_wl_shm_create_pool_opcode 0
-#define wayland_shm_pool_event_format 0
 
+#define wayland_shm_pool_event_format 0
 #define wayland_wl_shm_pool_create_buffer_opcode 0
 
 #define wayland_wl_compositor_create_surface_opcode 0
 
+#define wayland_xdg_wm_base_get_xdg_surface_opcode 2
+#define wayland_xdg_wm_base_pong_opcode 3
 #define wayland_xdg_wm_base_event_ping 0
+
+#define wayland_xdg_surface_get_toplevel_opcode 1
+#define wayland_xdg_surface_ack_configure_opcode 4
+#define wayland_xdg_surface_event_configure 0
+
 #define wayland_xdg_toplevel_event_configure 0
 #define wayland_xdg_toplevel_event_close 1
-#define wayland_xdg_surface_get_toplevel_opcode 1
-#define wayland_xdg_wm_base_pong_opcode 3
-#define wayland_xdg_surface_ack_configure_opcode 4
-#define wayland_xdg_wm_base_get_xdg_surface_opcode 2
-#define wayland_sdg_surface_event_configure 0
+
 
 #define wayland_format_xrgb8888 1
 
@@ -133,7 +136,7 @@ void str_append_n(String_Buffer *dest, String_View *src, size_t n) {
     assert(dest->count + n <= dest->cap);
     assert(src->count >= n);
     memcpy(dest->data + dest->count, src->data, n);
-    dest->count += src->count;
+    dest->count += n;
     dest->data[dest->count]=0;
 }
 
@@ -211,7 +214,7 @@ void buf_append_n(Byte_Buffer *dest, Byte_View *src, size_t n) {
     assert(dest->count + n <= dest->cap);
     assert(src->count >= n);
     memcpy(dest->data + dest->count, src->data, n);
-    dest->count += src->count;
+    dest->count += n;
 }
 
 internal void buf_write_u32(Byte_Buffer *buf, uint32 x) {
@@ -229,10 +232,9 @@ internal void buf_write_u16(Byte_Buffer *buf, uint16 x) {
     buf->count += sizeof(x);
 }
 internal void buf_write_string(Byte_Buffer *buf, String_View *src) {
-    buf_write_u32(buf, src->count);
-
+    buf_write_u32(buf, src->count+1);
     Byte_View str_bytes = {.data = (uint8 *)src->data, .count = src->count};
-    assert(buf->count + str_bytes.count < buf->cap);
+    assert(buf->count + roundup_4(str_bytes.count+1) <= buf->cap);
     buf_append(buf, &str_bytes);
     // Add null terminator
     buf->data[buf->count++] = 0;
@@ -266,6 +268,11 @@ internal void buf_read_n(Byte_View *buf, Byte_Buffer *dst, size_t n) {
     buf->count -= n;
 }
 
+//WAYLAND REQUESTS:
+//wl_display
+//wl_display.sync 
+//pending
+//wl_display.get_registry
 internal uint32 wayland_wl_display_get_registry(int fd) {
     // Create message buffer
     uint8 msg[128] = "";
@@ -292,12 +299,51 @@ internal uint32 wayland_wl_display_get_registry(int fd) {
     buf_write_u32(&msg_buf, wayland_current_id);
 
     // Send message to socket
-    if ((int64)msg_buf.count != 
+    if ((ssize_t)msg_buf.count != 
             send(fd, msg_buf.data, msg_buf.count, MSG_DONTWAIT)) {
         // TODO: Tighten up.
         exit(errno);
     }
     
+    return wayland_current_id;
+}
+//wl_registry
+//wl_registry.bind
+internal uint32 wayland_wl_registry_bind(int fd, uint32 wl_registryId, uint32 name, String_View *interface, uint32 version) {
+    fprintf(stderr, "Binding " SV_FMT "\n", SV_Arg(*interface));
+    uint8 msg[128] = "";
+    Byte_Buffer msg_buf = {
+        .data = msg,
+        .count = 0,
+        .cap = sizeof(msg)
+    };
+
+    buf_write_u32(&msg_buf, wl_registryId);
+
+    buf_write_u16(&msg_buf, wayland_wl_registry_bind_opcode);
+
+    uint16 msg_announced_size = 
+        wayland_header_size + sizeof(name) 
+        + sizeof(uint32) + roundup_4(interface->count+1) // string size and padded chars
+        + sizeof(version) + sizeof(wayland_current_id);
+    assert((msg_announced_size & 3) == 0);
+    buf_write_u16(&msg_buf, msg_announced_size);
+
+    buf_write_u32(&msg_buf, name);
+    buf_write_string(&msg_buf, interface);
+    buf_write_u32(&msg_buf, version);
+    wayland_current_id++;
+    buf_write_u32(&msg_buf, wayland_current_id);
+
+    assert((msg_buf.count & 3) == 0);
+    if ((ssize_t)msg_buf.count !=
+            send(fd, msg_buf.data, msg_buf.count, MSG_DONTWAIT)) {
+        // TODO: Tighten up.
+        fprintf(stderr, "Binding failed\n");
+        exit(errno);
+    }
+    fprintf(stderr, "Binding successful\n");
+
     return wayland_current_id;
 }
 
@@ -470,6 +516,31 @@ internal void init_compositor_message_buf(Compositor_Message_Buf *buf) {
     init_fd_queue(&buf->fd_queue);
 }
 
+enum WAYLAND_INTERFACE {
+    UNKNOWN_INTERFACE,
+    WL_DISPLAY_INTERFACE,
+    WL_REGISTRY_INTERFACE,
+    WL_CALLBACK_INTERFACE,
+    WL_COMPOSITOR_INTERFACE,
+    WL_SHM_POOL_INTERFACE,
+    WL_SHM_INTERFACE,
+    WL_BUFFER_INTERFACE,
+    WL_SURFACE_INTERFACE,
+    WL_KEYBOARD_INTERFACE,
+    XDG_WM_BASE_INTERFACE
+};
+typedef enum WAYLAND_INTERFACE WAYLAND_INTERFACE;
+
+internal WAYLAND_INTERFACE identify_interface(String_View *interface) {
+    char wl_shm_interface[] = "wl_shm";
+    char xdg_wm_base_interface[] = "xdg_wm_base";
+    char wl_compositor_interface[] = "wl_compositor";
+    if (strncmp(interface->data, wl_shm_interface, interface->count) == 0) return WL_SHM_INTERFACE;
+    if (strncmp(interface->data, xdg_wm_base_interface, interface->count) == 0) return XDG_WM_BASE_INTERFACE;
+    if (strncmp(interface->data, wl_compositor_interface, interface->count) == 0) return WL_COMPOSITOR_INTERFACE;
+    return UNKNOWN_INTERFACE;
+}
+
 internal void wayland_handle_message(int fd, state_t *state, 
         Byte_View *msg, Fd_Queue *fdq) {
     assert(msg->count >= 8);
@@ -513,10 +584,57 @@ internal void wayland_handle_message(int fd, state_t *state,
         switch (opcode) {
             case wayland_wl_registry_event_global: 
                 {
-                        fprintf(stderr,"global\npayload: ");
-                        fwrite(msg->data+8, 1, msg->count-8, stderr);
-                        fprintf(stderr,"\n");
-                        // read name, interface, version
+                    uint32 name = buf_read_u32(msg);
+                    uint32 interface_len = buf_read_u32(msg);
+                    uint32 padded_interface_len = roundup_4(interface_len);
+
+                    uint8 interface[512] = "";
+                    Byte_Buffer interface_buf = {
+                        .data = interface,
+                        .count = 0,
+                        .cap = sizeof(interface)
+                    };
+                    assert(padded_interface_len <= interface_buf.cap);
+
+                    buf_read_n(msg, &interface_buf, padded_interface_len);
+                    assert(interface[interface_len-1] == 0);
+                    uint32 version = buf_read_u32(msg);
+
+                    fprintf(stderr,"global\ninterface (%d): %s\n", interface_len, interface_buf.data);
+
+                    fprintf(stderr, "announced %u - actual %lu\n",announced_size,sizeof(object_id) + sizeof(opcode) + sizeof(announced_size) + sizeof(name) + sizeof(interface_len) + interface_buf.count + sizeof(version));
+                    fprintf(stderr,"%u - %u - %lu\n", interface_len, padded_interface_len, interface_buf.count);
+                    assert(announced_size == sizeof(object_id) + sizeof(opcode) + sizeof(announced_size) + sizeof(name) + sizeof(interface_len) + interface_buf.count + sizeof(version));
+
+                    String_View interface_sv = {
+                        .data = (char *)interface,
+                        .count = interface_len-1
+                    };
+                    switch(identify_interface(&interface_sv)) {
+                        case WL_SHM_INTERFACE: 
+                            {
+                                state->wl_shm = wayland_wl_registry_bind(
+                                        fd, state->wl_registry, name,
+                                        &interface_sv, version);
+                                        
+                            } break;
+                        case XDG_WM_BASE_INTERFACE:
+                            {
+                                state->xdg_wm_base = wayland_wl_registry_bind(
+                                        fd, state->wl_registry, name,
+                                        &interface_sv, version);
+                            } break;
+                        case WL_COMPOSITOR_INTERFACE:
+                            {
+                                state->wl_compositor = wayland_wl_registry_bind(
+                                        fd, state->wl_registry, name,
+                                        &interface_sv, version);
+                            } break;
+                        default:
+                            {
+                                fprintf(stderr,"unhandled interface\n");
+                            }
+                    }
                 } break;
         }
     }
