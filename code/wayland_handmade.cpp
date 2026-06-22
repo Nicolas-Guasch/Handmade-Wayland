@@ -72,6 +72,8 @@ global_variable uint32 wayland_current_id = 1;
 global_variable bool running = true;
 
 // Wayland protocol numeric values
+// wayland.app for clean documentation
+// opcodes and events start from 0, in documented order
 #define wayland_header_size 8
 
 #define wayland_display_object_id 1
@@ -95,6 +97,9 @@ global_variable bool running = true;
 
 #define wayland_wl_surface_attach_opcode 1
 #define wayland_wl_surface_commit_opcode 6
+#define wayland_wl_surface_event_enter 0
+#define wayland_wl_surface_event_leave 1
+#define wayland_wl_surface_event_preferred_buffer_scale 2
 
 // XDG shell interfaces numeric values
 #define wayland_xdg_wm_base_get_xdg_surface_opcode 2
@@ -107,6 +112,8 @@ global_variable bool running = true;
 
 #define wayland_xdg_toplevel_event_configure 0
 #define wayland_xdg_toplevel_event_close 1
+#define wayland_xdg_toplevel_event_configure_bounds 2
+#define wayland_xdg_toplevel_event_wm_capabilities 3
 
 
 #define wayland_format_xrgb8888 1
@@ -438,6 +445,32 @@ internal uint32 wayland_xdg_wm_base_get_xdg_surface(int fd, state_t *state) {
     }
     return wayland_current_id;
 }
+//xdg_wm_base_pong
+internal void wayland_xdg_wm_base_pong(int fd, state_t *state, uint32 ping) {
+    assert(state->xdg_wm_base > 0);
+    fprintf(stderr, "xdg_wm_base ping\n");
+    
+    uint8 msg[128] = "";
+    Byte_Buffer msg_buf = {
+        .data = msg,
+        .count = 0,
+        .cap = sizeof(msg)
+    };
+
+    buf_write_u32(&msg_buf, state->xdg_wm_base);
+
+    buf_write_u16(&msg_buf, wayland_xdg_wm_base_pong_opcode);
+    
+    uint16 msg_announced_size =
+        wayland_header_size + sizeof(ping);
+    buf_write_u16(&msg_buf, msg_announced_size);
+    buf_write_u32(&msg_buf, ping);
+
+    if ((ssize_t)msg_buf.count != 
+            send(fd, msg_buf.data, msg_buf.count, MSG_DONTWAIT)) {
+        exit(errno);
+    }
+}
 //xdg_surface
 //xdg_surface.get_toplevel
 internal uint32 wayland_xdg_surface_get_toplevel(int fd, state_t *state) {
@@ -461,11 +494,37 @@ internal uint32 wayland_xdg_surface_get_toplevel(int fd, state_t *state) {
     wayland_current_id++;
     buf_write_u32(&msg_buf, wayland_current_id);
 
-    if((ssize_t)msg_buf.count !=
+    if ((ssize_t)msg_buf.count !=
             send(fd, msg_buf.data, msg_buf.count, MSG_DONTWAIT)) {
         exit(errno);
     }
     return wayland_current_id;
+}
+//xdg_surface.ack_configure
+internal void wayland_xdg_surface_ack_configure(int fd, state_t *state,
+        uint32 serial) {
+    assert(state->xdg_surface > 0);
+
+    uint8 msg[128];
+    Byte_Buffer msg_buf = {
+        .data = msg,
+        .count = 0,
+        .cap = sizeof(msg)
+    };
+
+    buf_write_u32(&msg_buf, state->xdg_surface);
+
+    buf_write_u16(&msg_buf, wayland_xdg_surface_ack_configure_opcode);
+
+    uint16 msg_announced_size =
+        wayland_header_size + sizeof(serial);
+    buf_write_u16(&msg_buf, msg_announced_size);
+    buf_write_u32(&msg_buf, serial);
+
+    if ((ssize_t)msg_buf.count !=
+            send(fd, msg_buf.data, msg_buf.count, MSG_DONTWAIT)) {
+        exit(errno);
+    }
 }
 
 
@@ -758,8 +817,95 @@ internal void wayland_handle_message(int fd, state_t *state,
                             }
                     }
                 } break;
+            default:
+                {
+                    fprintf(stderr, "unhandled wl_registry event\n");
+                } 
         }
+    } else if (object_id == state->wl_shm) { 
+        switch (opcode) {
+            case wayland_wl_shm_event_format:
+                {
+                    uint32 format = buf_read_u32(msg);
+                    switch (format) {
+                        case 0:
+                            {
+                                fprintf(stderr, "argb8888 available\n");
+                            } break;
+                        case 1:
+                            {
+                                fprintf(stderr, "xrgb8888 available\n");
+                            } break;
+                        default:
+                            {
+                                fprintf(stderr, "format %x available\n",
+                                        format);
+                            }
+                    }
+                } break;
+        }
+    } else if (object_id == state->wl_surface) {
+        switch (opcode) {
+            case wayland_wl_surface_event_enter:
+                {
+                    fprintf(stderr, "IN: wl_surface@%u.enter\n", object_id);
+                } break;
+            case wayland_wl_surface_event_leave:
+                {
+                    fprintf(stderr, "IN: wl_surface@%u.leave\n", object_id);
+                } break;
+            case wayland_wl_surface_event_preferred_buffer_scale:
+                {
+                    uint32 factor = buf_read_u32(msg); // NOTE: signed but non-negative
+                    fprintf(stderr, "wl_surface@%u prefferred_buffer_scale = %u\n",
+                            object_id, factor);
+                } break;
+        }
+    } else if (object_id == state->xdg_wm_base) {
+        fprintf(stderr, "xdg_wm_base@%u event\n", object_id);
+        switch (opcode) {
+            case wayland_xdg_wm_base_event_ping:
+                {
+                    uint32 ping = buf_read_u32(msg);
+                    wayland_xdg_wm_base_pong(fd, state, ping);
+                } break;
+            default:
+                {
+                    fprintf(stderr, "unhandled xdg_wm_base event\n");
+                }
+        }
+    } else if (object_id == state->xdg_surface) {
+        fprintf(stderr, "xdg_surface@%u event\n", object_id);
+        switch (opcode) {
+            case wayland_xdg_surface_event_configure:
+                {
+                    fprintf(stderr, "IN: xdg_surface@%u.configure", object_id);
+                    uint32 serial = buf_read_u32(msg);
+                    wayland_xdg_surface_ack_configure(fd, state, serial);
+                    state->state = STATE_SURFACE_ACKED_CONFIGURE;
+                } break;
+        }
+    } else if (object_id == state->xdg_toplevel) {
+        fprintf(stderr, "xdg_toplevel@%u event\n", object_id);
+        switch (opcode) {
+            case wayland_xdg_toplevel_event_configure:
+                {
+                    fprintf(stderr, "IN: xdg_toplevel@%u.configure", object_id);
+                } break;
+            case wayland_xdg_toplevel_event_configure_bounds:
+                {
+                    fprintf(stderr, "IN: xdg_toplevel@%u.configure_bounds", object_id);
+                } break;
+            case wayland_xdg_toplevel_event_wm_capabilities:
+                {
+                    fprintf(stderr, "IN: xdg_toplevel@%u.wm_capabilities", object_id);
+                } break;
+        }
+    } else {
+        fprintf(stderr,"unhandled event:\nobject: %u\nopcode: %u\n",
+                object_id, opcode);
     }
+
 }
 
 enum EVENT_BUFFER_STATE {
