@@ -3,7 +3,7 @@
 #endif
 #include <stdio.h> //standard I/O
 #include <stdint.h> //types
-#include <stdlib.h> //getenv rand
+#include <stdlib.h> //getenv
 #include <errno.h> //EINVAL
 #include <assert.h> //assert
 #include <sys/un.h> //sockaddr_un
@@ -58,9 +58,9 @@ struct state_t {
     uint32 wl_registry;
     uint32 wl_shm;
     uint32 xdg_wm_base;
-    uint32 xdg_surface;
     uint32 wl_compositor;
     uint32 wl_surface;
+    uint32 xdg_surface;
     uint32 xdg_toplevel;
     shm_buffer *current_buffer;
     shm_buffer *retired_buffers;
@@ -75,25 +75,28 @@ global_variable bool running = true;
 #define wayland_header_size 8
 
 #define wayland_display_object_id 1
+#define wayland_wl_display_sync_opcode 0
 #define wayland_wl_display_get_registry_opcode 1
 #define wayland_wl_display_error_event 0
+#define wayland_wl_display_delete_id_event 1
 
 #define wayland_wl_registry_bind_opcode 0
 #define wayland_wl_registry_event_global 0
 #define wayland_wl_registry_event_global_remove 1
 
+#define wayland_wl_compositor_create_surface_opcode 0
+
+#define wayland_wl_shm_pool_create_buffer_opcode 0
+
+#define wayland_wl_shm_create_pool_opcode 0
+#define wayland_wl_shm_event_format 0
+
 #define wayland_wl_buffer_event_release 0
 
 #define wayland_wl_surface_attach_opcode 1
-#define wayland_wl_surface_commit_opcode6
+#define wayland_wl_surface_commit_opcode 6
 
-#define wayland_wl_shm_create_pool_opcode 0
-
-#define wayland_shm_pool_event_format 0
-#define wayland_wl_shm_pool_create_buffer_opcode 0
-
-#define wayland_wl_compositor_create_surface_opcode 0
-
+// XDG shell interfaces numeric values
 #define wayland_xdg_wm_base_get_xdg_surface_opcode 2
 #define wayland_xdg_wm_base_pong_opcode 3
 #define wayland_xdg_wm_base_event_ping 0
@@ -309,7 +312,9 @@ internal uint32 wayland_wl_display_get_registry(int fd) {
 }
 //wl_registry
 //wl_registry.bind
-internal uint32 wayland_wl_registry_bind(int fd, uint32 wl_registryId, uint32 name, String_View *interface, uint32 version) {
+internal uint32 wayland_wl_registry_bind(int fd, state_t *state, 
+        uint32 name, String_View *interface, uint32 version) {
+    assert(state->wl_registry > 0);
     fprintf(stderr, "Binding " SV_FMT "\n", SV_Arg(*interface));
     uint8 msg[128] = "";
     Byte_Buffer msg_buf = {
@@ -318,7 +323,7 @@ internal uint32 wayland_wl_registry_bind(int fd, uint32 wl_registryId, uint32 na
         .cap = sizeof(msg)
     };
 
-    buf_write_u32(&msg_buf, wl_registryId);
+    buf_write_u32(&msg_buf, state->wl_registry);
 
     buf_write_u16(&msg_buf, wayland_wl_registry_bind_opcode);
 
@@ -330,6 +335,8 @@ internal uint32 wayland_wl_registry_bind(int fd, uint32 wl_registryId, uint32 na
     buf_write_u16(&msg_buf, msg_announced_size);
 
     buf_write_u32(&msg_buf, name);
+    // NOTE: new_id without defined interface
+    // requires interface string name and version number
     buf_write_string(&msg_buf, interface);
     buf_write_u32(&msg_buf, version);
     wayland_current_id++;
@@ -346,6 +353,121 @@ internal uint32 wayland_wl_registry_bind(int fd, uint32 wl_registryId, uint32 na
 
     return wayland_current_id;
 }
+//wl_compositor
+//wl_compositor.create_surface
+internal uint32 wayland_wl_compositor_create_surface(int fd, state_t *state) {
+    assert(state->wl_compositor > 0);
+    uint8 msg[128] = "";
+    Byte_Buffer msg_buf = {
+        .data = msg,
+        .count = 0,
+        .cap = sizeof(msg)
+    };
+
+    buf_write_u32(&msg_buf, state->wl_compositor);
+
+    buf_write_u16(&msg_buf, wayland_wl_compositor_create_surface_opcode);
+
+    uint16 msg_announced_size =
+        wayland_header_size + sizeof(wayland_current_id);
+    //8+4 is aligned already.
+    buf_write_u16(&msg_buf, msg_announced_size);
+    wayland_current_id++;
+    buf_write_u32(&msg_buf, wayland_current_id);
+
+    if ((ssize_t)msg_buf.count !=
+            send(fd, msg_buf.data, msg_buf.count, MSG_DONTWAIT)) {
+        // TODO: Tighten up.
+        exit(errno);
+    }
+    return wayland_current_id;
+}
+//wl_surface
+//wl_surface_commit
+internal void wayland_wl_surface_commit(int fd, state_t *state) {
+    assert(state->wl_surface > 0);
+    uint8 msg[128] = "";
+    Byte_Buffer msg_buf = {
+        .data = msg,
+        .count = 0,
+        .cap = sizeof(msg)
+    };
+
+    buf_write_u32(&msg_buf, state->wl_surface);
+    buf_write_u16(&msg_buf, wayland_wl_surface_commit_opcode);
+    uint16 msg_announced_size = wayland_header_size;
+    buf_write_u16(&msg_buf, msg_announced_size);
+    if ((ssize_t)msg_buf.count !=
+            send(fd, msg_buf.data, msg_buf.count, MSG_DONTWAIT)) {
+        exit(errno);
+    }
+}
+
+
+//XDG shell requests
+
+//xdg_wm_base
+//xdg_wm_base_get_xdg_surface
+internal uint32 wayland_xdg_wm_base_get_xdg_surface(int fd, state_t *state) {
+    assert(state->xdg_wm_base > 0);
+    assert(state->wl_surface > 0);
+
+    uint8 msg[128] = "";
+    Byte_Buffer msg_buf = {
+        .data = msg,
+        .count = 0,
+        .cap = sizeof(msg)
+    };
+
+    buf_write_u32(&msg_buf, state->xdg_wm_base);
+
+    buf_write_u16(&msg_buf, wayland_xdg_wm_base_get_xdg_surface_opcode);
+    
+    uint16 msg_announced_size =
+        wayland_header_size + sizeof(wayland_current_id) + 
+        sizeof(state->wl_surface);
+    //8 + 4 + 4
+    buf_write_u16(&msg_buf, msg_announced_size);
+    wayland_current_id++;
+    buf_write_u32(&msg_buf, wayland_current_id);
+    buf_write_u32(&msg_buf, state->wl_surface);
+
+    if ((ssize_t)msg_buf.count !=
+            send(fd, msg_buf.data, msg_buf.count, MSG_DONTWAIT)) {
+        exit(errno);
+    }
+    return wayland_current_id;
+}
+//xdg_surface
+//xdg_surface.get_toplevel
+internal uint32 wayland_xdg_surface_get_toplevel(int fd, state_t *state) {
+    assert(state->xdg_surface > 0);
+    
+    uint8 msg[128];
+    Byte_Buffer msg_buf = {
+        .data = msg,
+        .count = 0,
+        .cap = sizeof(msg)
+    };
+
+    buf_write_u32(&msg_buf, state->xdg_surface);
+    
+    buf_write_u16(&msg_buf, wayland_xdg_surface_get_toplevel_opcode);
+
+    uint16 msg_announced_size =
+        wayland_header_size + sizeof(wayland_current_id);
+    //8 + 4
+    buf_write_u16(&msg_buf, msg_announced_size);
+    wayland_current_id++;
+    buf_write_u32(&msg_buf, wayland_current_id);
+
+    if((ssize_t)msg_buf.count !=
+            send(fd, msg_buf.data, msg_buf.count, MSG_DONTWAIT)) {
+        exit(errno);
+    }
+    return wayland_current_id;
+}
+
 
 //TODO: Request compositor to destroy wl_shm_pool wl_buffer.
 internal void destroy_buffer(shm_buffer *buf) {
@@ -614,20 +736,20 @@ internal void wayland_handle_message(int fd, state_t *state,
                         case WL_SHM_INTERFACE: 
                             {
                                 state->wl_shm = wayland_wl_registry_bind(
-                                        fd, state->wl_registry, name,
+                                        fd, state, name,
                                         &interface_sv, version);
                                         
                             } break;
                         case XDG_WM_BASE_INTERFACE:
                             {
                                 state->xdg_wm_base = wayland_wl_registry_bind(
-                                        fd, state->wl_registry, name,
+                                        fd, state, name,
                                         &interface_sv, version);
                             } break;
                         case WL_COMPOSITOR_INTERFACE:
                             {
                                 state->wl_compositor = wayland_wl_registry_bind(
-                                        fd, state->wl_registry, name,
+                                        fd, state, name,
                                         &interface_sv, version);
                             } break;
                         default:
@@ -813,6 +935,12 @@ int main(int argc, char * argv[]) {
         // Request a registry from wl_display to list and bind global objects.
         // wl_display::get_registry
         .wl_registry = wayland_wl_display_get_registry(fd),
+        .wl_shm = 0, //bind global
+        .xdg_wm_base = 0, //bind global
+        .wl_compositor = 0, //bind global
+        .wl_surface = 0, // wl_compositor.create_surface
+        .xdg_surface = 0, // xdg_wm_base.get_xdg_surface
+        .xdg_toplevel = 0 // xdg_surface.get_toplevel
     };
 
     resizeWindowBuffer(&clientState, defaultWidth, defaultHeight);
@@ -852,8 +980,18 @@ int main(int argc, char * argv[]) {
             // TODO: Log what happened.
             break;
         }
-        // TODO:
+
         // If bind phase complete, create surface.
+        if (clientState.wl_compositor != 0 && clientState.wl_shm != 0 &&
+            clientState.xdg_wm_base != 0 && clientState.wl_surface == 0) {
+            assert(clientState.state == STATE_NONE);
+
+            clientState.wl_surface = wayland_wl_compositor_create_surface(fd, &clientState);
+            clientState.xdg_surface = wayland_xdg_wm_base_get_xdg_surface(fd, &clientState);
+            clientState.xdg_toplevel = wayland_xdg_surface_get_toplevel(fd, &clientState);
+            wayland_wl_surface_commit(fd, &clientState);
+        }
+        // TODO:
         // If ack configure confirmed:
         //     Create wl_shm_pool if there's none.
         //     Create wl_buffer if there's none.
