@@ -411,7 +411,65 @@ internal void resizeWindowBuffer(state_t *state, uint32 width, uint32 height) {
     else free(buf);
 }
 
-internal void wayland_handle_message(int fd, state_t *state, Byte_View *msg) {
+#define WAYLAND_MAX_FDS_PER_RECVMSG 60 //libwayland-server harcodes the limit to 28
+#define WAYLAND_FD_QUEUE_CAP 512
+
+struct Fd_Queue {
+    int fds[WAYLAND_FD_QUEUE_CAP];
+    size_t head;
+    size_t count;
+    size_t cap;
+};
+typedef struct Fd_Queue Fd_Queue;
+
+
+internal void init_fd_queue(Fd_Queue *fdq) {
+    fdq->head = 0;
+    fdq->count = 0;
+    fdq->cap = WAYLAND_FD_QUEUE_CAP;
+}
+
+internal void Fd_Queue_Push(int fd, Fd_Queue *fdq) {
+    assert(fdq->count < fdq->cap);
+    int next = (fdq->head+fdq->count) < fdq->cap ?
+        (fdq->head+fdq->count) :
+        (fdq->head+fdq->count) - fdq->cap;
+
+    fdq->fds[next] = fd;  
+    fdq->count++;
+}
+
+internal int Fd_Queue_Pop(int fd, Fd_Queue *fdq) {
+    assert(fdq->count > 0);
+    int result = fdq->fds[fdq->head];
+    fdq->head++;
+    if (fdq->head == fdq->cap) {
+        fdq->head = 0;
+    }
+    fdq->count--;
+    return result;
+}
+
+#define WAYLAND_COMP_MSG_BUF_CAP 4096
+struct Compositor_Message_Buf {
+    uint8 read_buf[WAYLAND_COMP_MSG_BUF_CAP];
+    uint8 *head;
+    size_t count;
+    size_t cap;
+    Fd_Queue fd_queue;
+};
+typedef struct Compositor_Message_Buf Compositor_Message_Buf;
+
+internal void init_compositor_message_buf(Compositor_Message_Buf *buf) {
+    buf->head = buf->read_buf;
+    buf->count = 0;
+    buf->cap = sizeof(buf->read_buf);
+    memset(buf->read_buf, 0, buf->cap);
+    init_fd_queue(&buf->fd_queue);
+}
+
+internal void wayland_handle_message(int fd, state_t *state, 
+        Byte_View *msg, Fd_Queue *fdq) {
     assert(msg->count >= 8);
 
     uint32 object_id = buf_read_u32(msg);
@@ -462,21 +520,6 @@ internal void wayland_handle_message(int fd, state_t *state, Byte_View *msg) {
     }
 }
 
-struct Compositor_Message_Buf {
-    uint8 read_buf[4096];
-    uint8 *head;
-    size_t count;
-    size_t cap;
-};
-typedef struct Compositor_Message_Buf Compositor_Message_Buf;
-
-internal void init_compositor_message_buf(Compositor_Message_Buf *buf) {
-    buf->head = buf->read_buf;
-    buf->count = 0;
-    buf->cap = sizeof(buf->read_buf);
-    memset(buf->read_buf, 0, buf->cap);
-}
-
 enum EVENT_BUFFER_STATE {
     SOCKET_READ_SOME = 1,
     SOCKET_WOULD_BLOCK = 2,
@@ -486,8 +529,25 @@ enum EVENT_BUFFER_STATE {
 };
 typedef enum EVENT_BUFFER_STATE EVENT_BUFFER_STATE;
 
-internal int64 read_socket(int fd, uint8 **buffer, size_t *cap, EVENT_BUFFER_STATE *response) {
-    int64 read_bytes = recv(fd, *buffer, *cap, 0);
+internal int64 read_socket(int fd, uint8 **buffer, size_t *cap, Fd_Queue *fdq,
+        EVENT_BUFFER_STATE *response) {
+    struct iovec iov = {
+        .iov_base = *buffer,
+        .iov_len = *cap
+    };
+
+    union {
+        struct cmsghdr align;
+        uint8 bytes[CMSG_SPACE(sizeof(int) * WAYLAND_MAX_FDS_PER_RECVMSG)];
+    } control = {};
+
+    struct msghdr mh = {};
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    mh.msg_control = control.bytes;
+    mh.msg_controllen = sizeof(control.bytes);
+
+    ssize_t read_bytes = recvmsg(fd, &mh, MSG_CMSG_CLOEXEC);
     if (read_bytes == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             // NOTE: Non fatal error. Nothing to read.
@@ -503,9 +563,30 @@ internal int64 read_socket(int fd, uint8 **buffer, size_t *cap, EVENT_BUFFER_STA
     } else {
         *response = SOCKET_READ_SOME;
     }
+    if (mh.msg_flags & MSG_CTRUNC) {
+        // TODO: Log that ancillary fds were lost on transmission.
+        *response = SOCKET_ERROR;
+    }
     *buffer += read_bytes;
     *cap -= read_bytes;
     fprintf(stderr,"READ: %lu\n", read_bytes);
+
+    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&mh);
+            cmsg;
+            cmsg = CMSG_NXTHDR(&mh, cmsg)) {
+        if (cmsg->cmsg_level == SOL_SOCKET &&
+            cmsg->cmsg_type == SCM_RIGHTS) {
+            size_t data_len = cmsg->cmsg_len - CMSG_LEN(0);
+            size_t fd_count = data_len /sizeof(int);
+            int *fds = (int *)CMSG_DATA(cmsg);
+
+            for (size_t i = 0; i < fd_count; i++) {
+                Fd_Queue_Push(fds[i], fdq);
+                fprintf(stderr,"READ ANCILLARY FD: %d\n", fds[i]);
+            }
+        }
+    }
+
     return read_bytes;
 }
 
@@ -555,7 +636,8 @@ internal EVENT_BUFFER_STATE fetch_from_socket(int fd, Compositor_Message_Buf *bu
             // Last header is incomplete, retrieve announced_size
             size_t missing_header = wayland_header_size - buf->count;
             while (missing_header > 0) {
-                buf->count += read_socket(fd, &read_end, &missing_header, &response);
+                buf->count += read_socket(fd, &read_end, &missing_header,
+                        &buf->fd_queue, &response);
                 if (response != SOCKET_READ_SOME) return response;
             }
         }
@@ -567,7 +649,8 @@ internal EVENT_BUFFER_STATE fetch_from_socket(int fd, Compositor_Message_Buf *bu
             // Last message got cut on read.
             size_t missing_arguments = announced_size - buf->count;
             while (missing_arguments > 0) {
-                buf->count += read_socket(fd, &read_end, &missing_arguments, &response);
+                buf->count += read_socket(fd, &read_end, &missing_arguments,
+                        &buf->fd_queue, &response);
                 if (response != SOCKET_READ_SOME) return response;
             }
             assert(missing_arguments == 0);
@@ -577,7 +660,8 @@ internal EVENT_BUFFER_STATE fetch_from_socket(int fd, Compositor_Message_Buf *bu
     size_t free_count = (uint8 *)(buf->read_buf + buf->cap) - read_end;
     assert(free_count >= 0);
     if (free_count > 0 && buf->count == 0) {
-        buf->count += read_socket(fd, &read_end, &free_count, &response);
+        buf->count += read_socket(fd, &read_end, &free_count,
+                &buf->fd_queue, &response);
         if (response != SOCKET_READ_SOME) return response;
     }
     if (free_count == 0) {
@@ -627,7 +711,8 @@ int main(int argc, char * argv[]) {
                     .data = msg.data,
                     .count = msg.count
                 };
-                wayland_handle_message(fd, &clientState, &msg_view);
+                wayland_handle_message(fd, &clientState, 
+                        &msg_view, &read_buffer.fd_queue);
                 msg = {
                     .data = msg_buf,
                     .count = 0,
@@ -647,7 +732,7 @@ int main(int argc, char * argv[]) {
         //     Render frame
         //     wl_surface_attach
         //     wl_surface_commit
-        // Cleanup:
+        // Cleanup
         int timeout_ms = 16;
         struct pollfd pfd = {
             .fd = fd,
