@@ -89,14 +89,17 @@ global_variable bool running = true;
 #define wayland_wl_compositor_create_surface_opcode 0
 
 #define wayland_wl_shm_pool_create_buffer_opcode 0
+#define wayland_wl_shm_pool_destroy_opcode 1
 
 #define wayland_wl_shm_create_pool_opcode 0
 #define wayland_wl_shm_event_format 0
 
+#define wayland_wl_buffer_destroy_opcode 0
 #define wayland_wl_buffer_event_release 0
 
 #define wayland_wl_surface_attach_opcode 1
 #define wayland_wl_surface_commit_opcode 6
+#define wayland_wl_surface_damage_buffer_opcode 9
 #define wayland_wl_surface_event_enter 0
 #define wayland_wl_surface_event_leave 1
 #define wayland_wl_surface_event_preferred_buffer_scale 2
@@ -115,7 +118,7 @@ global_variable bool running = true;
 #define wayland_xdg_toplevel_event_configure_bounds 2
 #define wayland_xdg_toplevel_event_wm_capabilities 3
 
-
+#define wayland_format_argb8888 0
 #define wayland_format_xrgb8888 1
 
 #define cstring_len(s) (sizeof(s) - 1)
@@ -322,8 +325,8 @@ internal uint32 wayland_wl_display_get_registry(int fd) {
 internal uint32 wayland_wl_registry_bind(int fd, state_t *state, 
         uint32 name, String_View *interface, uint32 version) {
     assert(state->wl_registry > 0);
-    fprintf(stderr, "Binding " SV_FMT "\n", SV_Arg(*interface));
-    uint8 msg[128] = "";
+    //fprintf(stderr, "Binding " SV_FMT "\n", SV_Arg(*interface));
+    uint8 msg[512] = "";
     Byte_Buffer msg_buf = {
         .data = msg,
         .count = 0,
@@ -353,10 +356,10 @@ internal uint32 wayland_wl_registry_bind(int fd, state_t *state,
     if ((ssize_t)msg_buf.count !=
             send(fd, msg_buf.data, msg_buf.count, MSG_DONTWAIT)) {
         // TODO: Tighten up.
-        fprintf(stderr, "Binding failed\n");
+        //fprintf(stderr, "Binding failed\n");
         exit(errno);
     }
-    fprintf(stderr, "Binding successful\n");
+    //fprintf(stderr, "Binding successful\n");
 
     return wayland_current_id;
 }
@@ -389,8 +392,180 @@ internal uint32 wayland_wl_compositor_create_surface(int fd, state_t *state) {
     }
     return wayland_current_id;
 }
+//wl_shm_pool
+//wl_shm_pool.create_buffer
+internal uint32 wayland_wl_shm_pool_create_buffer(int fd, state_t *state) {
+    assert(state->current_buffer && state->current_buffer->wl_shm_pool > 0);
+    
+    uint8 msg[128] = "";
+    Byte_Buffer msg_buf = {
+        .data = msg,
+        .count = 0,
+        .cap = sizeof(msg)
+    };
+
+    buf_write_u32(&msg_buf, state->current_buffer->wl_shm_pool);
+    buf_write_u16(&msg_buf, wayland_wl_shm_pool_create_buffer_opcode);
+    uint16 msg_announced_size =
+        wayland_header_size + sizeof(wayland_current_id)
+        + sizeof(uint32) // offset
+        + sizeof(uint32) // width
+        + sizeof(uint32) // height
+        + sizeof(uint32) // stride
+        + sizeof(uint32); // format
+    buf_write_u16(&msg_buf, msg_announced_size);
+
+    wayland_current_id++;
+    buf_write_u32(&msg_buf, wayland_current_id);
+    uint32 offset = 0;
+    buf_write_u32(&msg_buf, offset);
+    buf_write_u32(&msg_buf, state->current_buffer->width);
+    buf_write_u32(&msg_buf, state->current_buffer->height);
+    uint32 stride = state->current_buffer->pitch;
+    // equal as we don't have row metadata
+    buf_write_u32(&msg_buf, stride);
+    buf_write_u32(&msg_buf, wayland_format_xrgb8888);
+    // change to wayland_format_axrgb8888 for alpha channel
+    if ((ssize_t)msg_buf.count !=
+            send(fd, msg_buf.data, msg_buf.count, MSG_DONTWAIT)) {
+        exit(errno);
+    }
+    return wayland_current_id;
+}
+//wl_shm_pool.destroy
+internal void wayland_wl_shm_pool_destroy(int fd, uint32 wl_shm_pool_id) {
+    assert(wl_shm_pool_id > 0);
+
+    uint8 msg[128] = "";
+    Byte_Buffer msg_buf = {
+        .data = msg,
+        .count = 0,
+        .cap = sizeof(msg)
+    };
+
+    buf_write_u32(&msg_buf, wl_shm_pool_id);
+    buf_write_u16(&msg_buf, wayland_wl_shm_pool_destroy_opcode);
+    uint16 msg_announced_size = 
+        wayland_header_size;
+    buf_write_u16(&msg_buf, msg_announced_size);
+
+    if ((ssize_t)msg_buf.count !=
+            send(fd, msg_buf.data, msg_buf.count, MSG_DONTWAIT)) {
+        exit(errno);
+    }
+}
+//wl_shm
+//wl_shm.create_pool
+internal uint32 wayland_wl_shm_create_pool(int fd, state_t *state) {
+    assert(state->wl_shm > 0);
+    assert(state->current_buffer);
+
+    uint8 msg[512] = "";
+    Byte_Buffer msg_buf = {
+        .data = msg,
+        .count = 0,
+        .cap = sizeof(msg)
+    };
+    
+    union {
+        struct cmsghdr align;
+        uint8 fd_buf[CMSG_SPACE(sizeof(state->current_buffer->fd))];
+    } control = {};
+
+    buf_write_u32(&msg_buf, state->wl_shm);
+    buf_write_u16(&msg_buf, wayland_wl_shm_create_pool_opcode);
+    uint16 msg_announced_size = 
+        wayland_header_size + sizeof(wayland_current_id) + 
+        sizeof(uint32);
+    buf_write_u16(&msg_buf, msg_announced_size);
+    
+    wayland_current_id++;
+    buf_write_u32(&msg_buf, wayland_current_id);
+    buf_write_u32(&msg_buf, state->current_buffer->size);
+
+
+    struct iovec io = {
+        .iov_base = msg_buf.data,
+        .iov_len = msg_buf.count
+    };
+
+    struct msghdr socket_msg = {
+        .msg_iov = &io,
+        .msg_iovlen = 1,
+        .msg_control = control.fd_buf,
+        .msg_controllen = sizeof(control.fd_buf)
+    };
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&socket_msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(state->current_buffer->fd));
+
+    *((int *)CMSG_DATA(cmsg)) = state->current_buffer->fd;
+    socket_msg.msg_controllen = CMSG_SPACE(sizeof(state->current_buffer->fd));
+
+    if (sendmsg(fd, &socket_msg, 0) == -1) {
+        fprintf(stderr, "wl_shm.create_pool sendmsg failed");
+        exit(errno);
+    }
+
+    // closing shm buffer fd, no longer needed.
+    close(state->current_buffer->fd);
+    state->current_buffer->fd = -1;
+
+    return wayland_current_id;
+}
+//wl_buffer
+//wl_buffer.destroy
+internal void wayland_wl_buffer_destroy(int fd, uint32 buffer_id) {
+    assert(buffer_id > 0);
+
+    uint8 msg[128] = "";
+    Byte_Buffer msg_buf = {
+        .data = msg,
+        .count = 0,
+        .cap = sizeof(msg)
+    };
+
+    buf_write_u32(&msg_buf, buffer_id);
+    buf_write_u16(&msg_buf, wayland_wl_buffer_destroy_opcode);
+    uint16 msg_announced_size = wayland_header_size;
+    buf_write_u16(&msg_buf, msg_announced_size);
+
+    if ((ssize_t) msg_buf.count !=
+            send(fd, msg_buf.data, msg_buf.count, MSG_DONTWAIT)) {
+        exit(errno);
+    }
+}
 //wl_surface
-//wl_surface_commit
+//wl_surface.attach
+internal void wayland_wl_surface_attach(int fd, state_t *state) {
+    assert(state->wl_surface > 0);
+    assert(state->current_buffer != NULL 
+            && state->current_buffer->wl_buffer > 0);
+    
+    uint8 msg[128] = "";
+    Byte_Buffer msg_buf = {
+        .data = msg,
+        .count = 0,
+        .cap = sizeof(msg)
+    };
+
+    buf_write_u32(&msg_buf, state->wl_surface);
+    buf_write_u16(&msg_buf, wayland_wl_surface_attach_opcode);
+    uint16 msg_announced_size = 
+        wayland_header_size + sizeof(uint32) + sizeof(int32) + sizeof(int32);
+    buf_write_u16(&msg_buf, msg_announced_size);
+    buf_write_u32(&msg_buf, state->current_buffer->wl_buffer);
+    buf_write_u32(&msg_buf, 0); // x,y required to be zero
+    buf_write_u32(&msg_buf, 0);
+    if ((ssize_t)msg_buf.count !=
+            send(fd, msg_buf.data, msg_buf.count, MSG_DONTWAIT)) {
+        exit(errno);
+    }
+    state->current_buffer->busy = true;
+}
+//wl_surface.commit
 internal void wayland_wl_surface_commit(int fd, state_t *state) {
     assert(state->wl_surface > 0);
     uint8 msg[128] = "";
@@ -404,6 +579,35 @@ internal void wayland_wl_surface_commit(int fd, state_t *state) {
     buf_write_u16(&msg_buf, wayland_wl_surface_commit_opcode);
     uint16 msg_announced_size = wayland_header_size;
     buf_write_u16(&msg_buf, msg_announced_size);
+    if ((ssize_t)msg_buf.count !=
+            send(fd, msg_buf.data, msg_buf.count, MSG_DONTWAIT)) {
+        exit(errno);
+    }
+}
+//wl_surface.damage_buffer
+internal void wayland_wl_surface_damage_buffer(int fd, state_t *state,
+        int x, int y, int width, int height) {
+    assert(state->wl_surface > 0);
+    assert(state->current_buffer);
+
+    uint8 msg[128] = "";
+    Byte_Buffer msg_buf = {
+        .data = msg,
+        .count = 0,
+        .cap = sizeof(msg)
+    };
+
+    buf_write_u32(&msg_buf, state->wl_surface);
+    buf_write_u16(&msg_buf, wayland_wl_surface_damage_buffer_opcode);
+    uint16 msg_announced_size = 
+        wayland_header_size + 4 * sizeof(uint32);
+    buf_write_u16(&msg_buf, msg_announced_size);
+
+    buf_write_u32(&msg_buf, x);
+    buf_write_u32(&msg_buf, y);
+    buf_write_u32(&msg_buf, width);
+    buf_write_u32(&msg_buf, height);
+
     if ((ssize_t)msg_buf.count !=
             send(fd, msg_buf.data, msg_buf.count, MSG_DONTWAIT)) {
         exit(errno);
@@ -529,7 +733,7 @@ internal void wayland_xdg_surface_ack_configure(int fd, state_t *state,
 
 
 //TODO: Request compositor to destroy wl_shm_pool wl_buffer.
-internal void destroy_buffer(shm_buffer *buf) {
+internal void destroy_buffer(int fd, shm_buffer *buf) {
     assert(!buf->busy);
     if (munmap(buf->data, buf->size) == -1) {
         // TODO: Tighten up.
@@ -539,15 +743,26 @@ internal void destroy_buffer(shm_buffer *buf) {
         // TODO: Tighten up.
         exit(errno);
     }
-    if (buf->wl_buffer){}   // TODO: Destroy wl_buffer.
-    if (buf->wl_shm_pool){} // TODO: Destroy wl_shm_pool.
-                            // When would these happen???
-                            // busy is already false.
+    if (buf->wl_buffer > 0) {
+        wayland_wl_buffer_destroy(fd, buf->wl_buffer);
+    }   // TODO: Destroy wl_buffer.
+    if (buf->wl_shm_pool > 0){
+        wayland_wl_shm_pool_destroy(fd, buf->wl_shm_pool);
+    } // TODO: Destroy wl_shm_pool.
     free(buf);
 }
 
-// TODO: handle this event.
-internal void on_wl_buffer_release(state_t *state, uint32 buffer_id) {
+// TODO: optimize.
+internal bool is_ID_on_retired_buffers(state_t *state, uint32 object_id) {
+    shm_buffer *current = state->retired_buffers;
+    while (current) {
+        if (current->wl_buffer == object_id) return true;
+        current = current->next;
+    }
+    return false;
+}
+
+internal void on_wl_buffer_release(int fd, state_t *state, uint32 buffer_id) {
     if (state->current_buffer && buffer_id == state->current_buffer->wl_buffer) {
         state->current_buffer->busy = false;
         return;
@@ -559,13 +774,14 @@ internal void on_wl_buffer_release(state_t *state, uint32 buffer_id) {
         current = current->next;
     }
     if (current) {
+        current->busy=false;
         if (!previous) {
             state->retired_buffers = current->next;
         }
         else {
             previous->next = current->next;
         }
-        destroy_buffer(current);
+        destroy_buffer(fd, current);
     }
 }
 
@@ -599,7 +815,7 @@ internal bool create_shared_memory_file(shm_buffer *new_shm) {
     }
 }
 
-internal void resizeWindowBuffer(state_t *state, uint32 width, uint32 height) {
+internal void resizeWindowBuffer(int fd, state_t *state, uint32 width, uint32 height) {
     shm_buffer *current = state->current_buffer;
     uint32 pitch = width * bytes_per_pixel;
     size_t size = pitch * height; // TODO: Clamp pitch, size to [1,max]?
@@ -620,13 +836,13 @@ internal void resizeWindowBuffer(state_t *state, uint32 width, uint32 height) {
         .size = size,
         .fd = -1,
         .data = NULL,
-        .busy = false, // NOTE: Until commited.
+        .busy = false,
         .next = NULL
     };
     if (create_shared_memory_file(buf)) {
         if (current) {
             if (!current->busy) {
-                destroy_buffer(current);
+                destroy_buffer(fd, current);
             }
             else {
                 current->next = state->retired_buffers;
@@ -634,7 +850,9 @@ internal void resizeWindowBuffer(state_t *state, uint32 width, uint32 height) {
             }
         }
         state->current_buffer = buf;
-        // TODO: On wl_shm.create_pool, close fd.
+        if (state->state == STATE_SURFACE_ATTACHED) {
+            state->state = STATE_SURFACE_ACKED_CONFIGURE;
+        }
     }
     else free(buf);
 }
@@ -754,14 +972,14 @@ internal void wayland_handle_message(int fd, state_t *state,
                     buf_read_n(msg, &error_msg, error_len);
                     
                     fprintf(stderr, 
-                            "fatal error: target_object_id=%u code=%u error="
-                            SV_FMT "\n",
-                            target_object_id, code, SV_Arg(error_msg));
+                          "fatal error: target_object_id=%u code=%u error="
+                          SV_FMT "\n",
+                          target_object_id, code, SV_Arg(error_msg));
                     running = false;
                 } break;
         }
     } else if (object_id == state->wl_registry) {
-        fprintf(stderr,"wl_registry event:");
+        //fprintf(stderr,"wl_registry event:");
         switch (opcode) {
             case wayland_wl_registry_event_global: 
                 {
@@ -781,10 +999,8 @@ internal void wayland_handle_message(int fd, state_t *state,
                     assert(interface[interface_len-1] == 0);
                     uint32 version = buf_read_u32(msg);
 
-                    fprintf(stderr,"global\ninterface (%d): %s\n", interface_len, interface_buf.data);
+                    //fprintf(stderr,"global\ninterface (%d): %s v%u\n", interface_len, interface_buf.data, version);
 
-                    fprintf(stderr, "announced %u - actual %lu\n",announced_size,sizeof(object_id) + sizeof(opcode) + sizeof(announced_size) + sizeof(name) + sizeof(interface_len) + interface_buf.count + sizeof(version));
-                    fprintf(stderr,"%u - %u - %lu\n", interface_len, padded_interface_len, interface_buf.count);
                     assert(announced_size == sizeof(object_id) + sizeof(opcode) + sizeof(announced_size) + sizeof(name) + sizeof(interface_len) + interface_buf.count + sizeof(version));
 
                     String_View interface_sv = {
@@ -813,13 +1029,13 @@ internal void wayland_handle_message(int fd, state_t *state,
                             } break;
                         default:
                             {
-                                fprintf(stderr,"unhandled interface\n");
+                                //fprintf(stderr,"unhandled interface\n");
                             }
                     }
                 } break;
             default:
                 {
-                    fprintf(stderr, "unhandled wl_registry event\n");
+                    //fprintf(stderr, "unhandled wl_registry event\n");
                 } 
         }
     } else if (object_id == state->wl_shm) { 
@@ -830,39 +1046,55 @@ internal void wayland_handle_message(int fd, state_t *state,
                     switch (format) {
                         case 0:
                             {
-                                fprintf(stderr, "argb8888 available\n");
+                                //fprintf(stderr, "argb8888 available\n");
                             } break;
                         case 1:
                             {
-                                fprintf(stderr, "xrgb8888 available\n");
+                                //fprintf(stderr, "xrgb8888 available\n");
                             } break;
                         default:
                             {
-                                fprintf(stderr, "format %x available\n",
-                                        format);
+                                //fprintf(stderr, "format %x available\n",
+                                //      format);
                             }
                     }
+                } break;
+        }
+    } else if (state->current_buffer && 
+            object_id == state->current_buffer->wl_buffer) {
+        switch (opcode) {
+            case wayland_wl_buffer_event_release:
+                {
+                    //fprintf(stderr, "Current buffer released.\n");
+                    state->current_buffer->busy = false;
+                } break;
+        }
+    } else if (is_ID_on_retired_buffers(state, object_id)) {
+        switch (opcode) {
+            case wayland_wl_buffer_event_release:
+                {
+                    on_wl_buffer_release(fd, state, object_id);
                 } break;
         }
     } else if (object_id == state->wl_surface) {
         switch (opcode) {
             case wayland_wl_surface_event_enter:
                 {
-                    fprintf(stderr, "IN: wl_surface@%u.enter\n", object_id);
+                    //fprintf(stderr, "IN: wl_surface@%u.enter\n", object_id);
                 } break;
             case wayland_wl_surface_event_leave:
                 {
-                    fprintf(stderr, "IN: wl_surface@%u.leave\n", object_id);
+                    //fprintf(stderr, "IN: wl_surface@%u.leave\n", object_id);
                 } break;
             case wayland_wl_surface_event_preferred_buffer_scale:
                 {
                     uint32 factor = buf_read_u32(msg); // NOTE: signed but non-negative
-                    fprintf(stderr, "wl_surface@%u prefferred_buffer_scale = %u\n",
-                            object_id, factor);
+                    //fprintf(stderr, "wl_surface@%u prefferred_buffer_scale = %u\n",
+                    //      object_id, factor);
                 } break;
         }
     } else if (object_id == state->xdg_wm_base) {
-        fprintf(stderr, "xdg_wm_base@%u event\n", object_id);
+        //fprintf(stderr, "xdg_wm_base@%u event\n", object_id);
         switch (opcode) {
             case wayland_xdg_wm_base_event_ping:
                 {
@@ -871,39 +1103,47 @@ internal void wayland_handle_message(int fd, state_t *state,
                 } break;
             default:
                 {
-                    fprintf(stderr, "unhandled xdg_wm_base event\n");
+                    //fprintf(stderr, "unhandled xdg_wm_base event\n");
                 }
         }
     } else if (object_id == state->xdg_surface) {
-        fprintf(stderr, "xdg_surface@%u event\n", object_id);
+        //fprintf(stderr, "xdg_surface@%u event\n", object_id);
         switch (opcode) {
             case wayland_xdg_surface_event_configure:
                 {
-                    fprintf(stderr, "IN: xdg_surface@%u.configure", object_id);
+                    //fprintf(stderr, "IN: xdg_surface@%u.configure\n", object_id);
                     uint32 serial = buf_read_u32(msg);
                     wayland_xdg_surface_ack_configure(fd, state, serial);
                     state->state = STATE_SURFACE_ACKED_CONFIGURE;
                 } break;
         }
     } else if (object_id == state->xdg_toplevel) {
-        fprintf(stderr, "xdg_toplevel@%u event\n", object_id);
+        //fprintf(stderr, "xdg_toplevel@%u event\n", object_id);
         switch (opcode) {
             case wayland_xdg_toplevel_event_configure:
                 {
-                    fprintf(stderr, "IN: xdg_toplevel@%u.configure", object_id);
+                    fprintf(stderr, "IN: xdg_toplevel@%u.configure\n", object_id);
+                } break;
+            case wayland_xdg_toplevel_event_close:
+                {
+                    fprintf(stderr, "IN: xdg_toplevel@%u.close\n", object_id);
+                    running = false;
                 } break;
             case wayland_xdg_toplevel_event_configure_bounds:
                 {
-                    fprintf(stderr, "IN: xdg_toplevel@%u.configure_bounds", object_id);
+                    fprintf(stderr, "IN: xdg_toplevel@%u.configure_bounds\n", object_id);
+                    uint32 width = buf_read_u32(msg);
+                    uint32 height = buf_read_u32(msg);
+                    resizeWindowBuffer(fd, state, width, height);
                 } break;
             case wayland_xdg_toplevel_event_wm_capabilities:
                 {
-                    fprintf(stderr, "IN: xdg_toplevel@%u.wm_capabilities", object_id);
+                    fprintf(stderr, "IN: xdg_toplevel@%u.wm_capabilities\n", object_id);
                 } break;
         }
     } else {
         fprintf(stderr,"unhandled event:\nobject: %u\nopcode: %u\n",
-                object_id, opcode);
+              object_id, opcode);
     }
 
 }
@@ -956,7 +1196,7 @@ internal int64 read_socket(int fd, uint8 **buffer, size_t *cap, Fd_Queue *fdq,
         *response = SOCKET_ERROR;
         read_bytes = 0;
     }
-    fprintf(stderr,"READ: %zd - result=%d\n", read_bytes,*response);
+    //fprintf(stderr,"READ: %zd - result=%d\n", read_bytes,*response);
     
     if (read_bytes) {
         *buffer += read_bytes;
@@ -977,7 +1217,7 @@ internal int64 read_socket(int fd, uint8 **buffer, size_t *cap, Fd_Queue *fdq,
                         *response = SOCKET_ERROR;
                         return 0;
                     }
-                    fprintf(stderr,"READ ANCILLARY FD: %d\n", fds[i]);
+                    //fprintf(stderr,"READ ANCILLARY FD: %d\n", fds[i]);
                 }
             }
         }
@@ -1000,7 +1240,7 @@ internal void shift_buffer(Compositor_Message_Buf *buf) {
 }
 
 internal bool get_compositor_message(Compositor_Message_Buf *buf, Byte_Buffer *msg) {
-    fprintf(stderr,"EVENT BUFFER: %lu\n\n", buf->count);
+    //fprintf(stderr,"EVENT BUFFER: %lu\n\n", buf->count);
     if (buf->count < wayland_header_size) {
         // Last header is incomplete, retrieve announced_size
         return false;
@@ -1066,6 +1306,20 @@ internal EVENT_BUFFER_STATE fetch_from_socket(int fd, Compositor_Message_Buf *bu
     return response;
 }
 
+internal void render_bitmap(shm_buffer *shm_buf, int xOffset, int yOffset) {
+    uint8 *row = shm_buf->data;
+    for (int y = 0; y < shm_buf->height; y++) {
+        uint32 *pixel = (uint32 *)row;
+        for (int x = 0; x < shm_buf->width; x++) {
+            uint8 red = (uint8)((x+xOffset)^(y+yOffset));
+            uint8 green = (uint8)(y + yOffset);
+            uint8 blue = (uint8)(x + xOffset);
+            *pixel++ = ((uint32)red << 0x10) | ((uint32)green << 0x8) | ((uint32)blue);
+        }
+        row += shm_buf->pitch;
+    }
+}
+
 int main(int argc, char * argv[]) {
     (void)argc;
     (void)argv;
@@ -1089,10 +1343,12 @@ int main(int argc, char * argv[]) {
         .xdg_toplevel = 0 // xdg_surface.get_toplevel
     };
 
-    resizeWindowBuffer(&clientState, defaultWidth, defaultHeight);
+    resizeWindowBuffer(fd, &clientState, defaultWidth, defaultHeight);
 
     Compositor_Message_Buf read_buffer;
     init_compositor_message_buf(&read_buffer);
+    int offsetX = 0;
+    int offsetY = 0;
     while (running) {
         uint8 msg_buf[4096] = "";
 
@@ -1137,21 +1393,53 @@ int main(int argc, char * argv[]) {
             clientState.xdg_toplevel = wayland_xdg_surface_get_toplevel(fd, &clientState);
             wayland_wl_surface_commit(fd, &clientState);
         }
-        // TODO:
-        // If ack configure confirmed:
-        //     Create wl_shm_pool if there's none.
-        //     Create wl_buffer if there's none.
-        //     Render frame
-        //     wl_surface_attach
-        //     wl_surface_commit
-        // Cleanup
+        if (clientState.state == STATE_SURFACE_ACKED_CONFIGURE) {
+            assert(clientState.wl_surface > 0);
+            assert(clientState.xdg_surface > 0);
+            assert(clientState.xdg_toplevel > 0);
+
+            shm_buffer *current_buf = clientState.current_buffer;
+            assert(current_buf);
+            
+            if (current_buf->wl_shm_pool == 0) {
+                current_buf->wl_shm_pool = 
+                    wayland_wl_shm_create_pool(fd, &clientState);
+            }
+            if (current_buf->wl_buffer == 0) {
+                current_buf->wl_buffer = 
+                    wayland_wl_shm_pool_create_buffer(fd, &clientState);
+            }
+
+            assert(current_buf->wl_shm_pool > 0);
+            assert(current_buf->wl_buffer > 0);
+
+            render_bitmap(current_buf, offsetX, offsetY);
+            wayland_wl_surface_attach(fd, &clientState);
+            wayland_wl_surface_damage_buffer(fd, &clientState,
+                    0, 0, current_buf->width, current_buf->height);
+            wayland_wl_surface_commit(fd, &clientState);
+
+            clientState.state = STATE_SURFACE_ATTACHED;
+            offsetX++;
+            offsetY -= 2;
+        } else if (clientState.state == STATE_SURFACE_ATTACHED &&
+                !clientState.current_buffer->busy) {
+            shm_buffer *current_buf = clientState.current_buffer;
+            render_bitmap(current_buf, offsetX, offsetY);
+            wayland_wl_surface_attach(fd, &clientState);
+            wayland_wl_surface_damage_buffer(fd, &clientState,
+                    0, 0, current_buf->width, current_buf->height);
+            wayland_wl_surface_commit(fd, &clientState);
+            offsetX++;
+            offsetY -= 2;
+        }
         int timeout_ms = 16;
         struct pollfd pfd = {
             .fd = fd,
             .events = POLLIN
         };
 
-        poll(&pfd, 1, timeout_ms);
+        //poll(&pfd, 1, timeout_ms);
 
     }
 
