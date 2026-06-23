@@ -17,10 +17,12 @@ While this should work on any compositor, I'm aiming for the minimal tiling comp
 - Handle initial chat with the compositor.
 - Binded all the needed global objects.
 - Get a wl_surface ready to attach a buffer.
-
-## Current goals
 - Request from wl_shm a wl_shm_pool for our shared memory. Create a wl_buffer from it.
 - Write some bitmap to the shared memory file.
 - Attach the buffer to the surface and commit it.
-- Get anything visible on screen.
-- Handle resizing events.
+- On toplevel close, stop running
+- On toplevel configure_bounds, resize buffer.
+- Mark the wl_buffer as damaged every frame so it animates
+
+## Current goals
+- Handle input
